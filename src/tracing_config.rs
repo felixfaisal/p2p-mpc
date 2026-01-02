@@ -76,15 +76,13 @@ pub fn init_jaegar_trace(
         .with_endpoint(endpoint)
         .build()?;
 
-    let resource = Resource::builder()
-        .with_service_name("executor-worker")
-        .build();
+    let resource = Resource::builder().with_service_name("p2p-worker").build();
 
     let tracer_provider = SdkTracerProvider::builder()
         .with_resource(resource)
         .with_batch_exporter(exporter)
         .build();
 
-    let tracer = tracer_provider.tracer("executor-worker");
+    let tracer = tracer_provider.tracer("p2p-worker");
     Ok(tracer)
 }
