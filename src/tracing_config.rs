@@ -11,26 +11,30 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
 pub fn init_trace(
-    host: Option<&str>,
-    port: Option<u16>,
+    jaeger_host: &str,
+    jaeger_port: u16,
     enable_jaegar: bool,
     json_trace_output: bool,
-    json_trace_file: Option<&str>,
+    json_trace_file: &str,
+    log_level: &str,
 ) {
     global::set_text_map_propagator(TraceContextPropagator::new());
     LogTracer::init().expect("Could not initialize log tracer");
 
+    // Create the EnvFilter with the provided log level as fallback
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+
     if enable_jaegar {
         // Use Jaeger tracing with OpenTelemetry
-        let tracer = init_jaegar_trace(host.unwrap(), port.unwrap()).unwrap();
+        let tracer = init_jaegar_trace(jaeger_host, jaeger_port)
+            .expect("Failed to initialize Jaeger tracer");
         let telemetry =
             tracing_opentelemetry::layer::<tracing_subscriber::Registry>().with_tracer(tracer);
 
         let subscriber = tracing_subscriber::Registry::default()
             .with(telemetry)
-            .with(tracing_subscriber::fmt::layer().with_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            ));
+            .with(tracing_subscriber::fmt::layer().with_filter(env_filter));
 
         tracing::subscriber::set_global_default(subscriber)
             .expect("setting default subscriber failed");
@@ -40,15 +44,13 @@ pub fn init_trace(
             .create(true)
             .write(true)
             .truncate(true)
-            .open(json_trace_file.expect("Json Trace file path is required"))
+            .open(json_trace_file)
             .expect("Failed to create trace file");
 
         let subscriber = FmtSubscriber::builder()
             .json()
             .with_writer(trace_file)
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
+            .with_env_filter(env_filter)
             .finish();
 
         tracing::subscriber::set_global_default(subscriber)
@@ -56,9 +58,7 @@ pub fn init_trace(
     } else {
         // Use regular logging without Jaeger
         let subscriber = FmtSubscriber::builder()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
+            .with_env_filter(env_filter)
             .finish();
 
         tracing::subscriber::set_global_default(subscriber)

@@ -1,11 +1,24 @@
+mod cli;
 mod metrics;
 mod tracing_config;
 
+use clap::Parser;
+use cli::Cli;
+
 #[tokio::main]
 async fn main() {
-    // Initialize tracing configuration
-    tracing_config::init_trace(None, None, false, false, None);
+    let cli = Cli::parse();
 
-    // Start the Prometheus metrics server on port 9090
-    metrics::start_metrics_server(9090).await;
+    // Initialize tracing configuration
+    tracing_config::init_trace(
+        &cli.jaeger_host,
+        cli.jaeger_port,
+        cli.enable_jaeger,
+        cli.json_trace,
+        &cli.json_trace_file,
+        &cli.log_level,
+    );
+
+    // Start the Prometheus metrics server
+    metrics::start_metrics_server(cli.metrics_port).await;
 }
