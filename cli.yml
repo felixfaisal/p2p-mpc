@@ -1,0 +1,65 @@
+# CLI Configuration for p2p-mpc
+# This file describes all command-line arguments available for the application
+
+arguments:
+  # Metrics Configuration
+  - name: metrics-port
+    short: m
+    long: metrics-port
+    type: u16
+    default: 9090
+    description: Port number for the Prometheus metrics server
+    example: --metrics-port 9090
+
+  # Tracing Configuration
+  - name: enable-jaeger
+    short: j
+    long: enable-jaeger
+    type: bool
+    default: false
+    description: Enable Jaeger distributed tracing
+    example: --enable-jaeger
+
+  - name: jaeger-host
+    long: jaeger-host
+    type: string
+    default: localhost
+    description: Jaeger collector host address (required when enable-jaeger is true)
+    example: --jaeger-host localhost
+
+  - name: jaeger-port
+    long: jaeger-port
+    type: u16
+    default: 4317
+    description: Jaeger collector port (required when enable-jaeger is true)
+    example: --jaeger-port 4317
+
+  # JSON Trace Output
+  - name: json-trace
+    long: json-trace
+    type: bool
+    default: false
+    description: Enable JSON formatted trace output to file
+    example: --json-trace
+
+  - name: json-trace-file
+    long: json-trace-file
+    type: string
+    default: traces.json
+    description: File path for JSON trace output (required when json-trace is true)
+    example: --json-trace-file ./logs/traces.json
+
+  # Log Level
+  - name: log-level
+    short: l
+    long: log-level
+    type: string
+    default: info
+    description: Set the logging level (trace, debug, info, warn, error)
+    example: --log-level debug
+
+notes:
+  - If both enable-jaeger and json-trace are false, standard logging will be used
+  - When enable-jaeger is true, jaeger-host and jaeger-port must be provided
+  - When json-trace is true, json-trace-file must be provided
+  - The RUST_LOG environment variable can override the log-level setting
