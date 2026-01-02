@@ -2,6 +2,7 @@
 # This file describes all command-line arguments available for the application
 
 arguments:
+<<<<<<< HEAD
   # Configuration File
   - name: config
     short: c
@@ -10,6 +11,8 @@ arguments:
     description: Path to YAML configuration file
     example: --config config.yml
 
+=======
+>>>>>>> 7623acb (add: setup basic cli  (#2))
   # Metrics Configuration
   - name: metrics-port
     short: m
@@ -66,6 +69,7 @@ arguments:
     description: Set the logging level (trace, debug, info, warn, error)
     example: --log-level debug
 
+<<<<<<< HEAD
   # Network Configuration
   - name: network-port
     short: p
@@ -111,10 +115,16 @@ arguments:
 
 notes:
   - Configuration priority: CLI args > Config file > Defaults
+=======
+notes:
+>>>>>>> 7623acb (add: setup basic cli  (#2))
   - If both enable-jaeger and json-trace are false, standard logging will be used
   - When enable-jaeger is true, jaeger-host and jaeger-port must be provided
   - When json-trace is true, json-trace-file must be provided
   - The RUST_LOG environment variable can override the log-level setting
+<<<<<<< HEAD
   - Network port 0 will use a random available port assigned by the OS
   - Bootnodes should include the peer ID in the multiaddr
   - Topics are used for gossipsub pub/sub messaging
+=======
+>>>>>>> 7623acb (add: setup basic cli  (#2))
