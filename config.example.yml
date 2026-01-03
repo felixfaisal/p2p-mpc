@@ -1,0 +1,43 @@
+# Example configuration file for p2p-mpc
+# Copy this file to config.yml and modify as needed
+# Run with: cargo run -- --config config.yml
+
+# Prometheus metrics server port
+metrics_port: 9090
+
+# Jaeger distributed tracing configuration
+enable_jaeger: false
+jaeger_host: localhost
+jaeger_port: 4317
+
+# JSON trace output configuration
+json_trace: false
+json_trace_file: traces.json
+
+# Logging level: trace, debug, info, warn, error
+log_level: info
+
+# Network configuration
+# P2P network listening port (0 for random available port)
+network_port: 0
+
+# Bootstrap nodes (include peer ID in multiaddr)
+bootnodes:
+  - /ip4/127.0.0.1/tcp/9000/p2p/12D3KooWExampleBootNode1
+  - /ip4/127.0.0.1/tcp/9001/p2p/12D3KooWExampleBootNode2
+
+# Seed nodes (without peer ID)
+seed_nodes:
+  - /ip4/127.0.0.1/tcp/9002
+  - /ip4/127.0.0.1/tcp/9003
+
+# Gossipsub topics to subscribe to
+topics:
+  - mpc-computation
+  - mpc-control
+
+# Optional: explicit peer ID to add to gossipsub
+# explicit_peer: 12D3KooWExamplePeerID
+
+# Optional: path to identity key file (will generate new if not provided)
+# identity_key_path: ./keys/identity.key

@@ -2,6 +2,14 @@
 # This file describes all command-line arguments available for the application
 
 arguments:
+  # Configuration File
+  - name: config
+    short: c
+    long: config
+    type: string
+    description: Path to YAML configuration file
+    example: --config config.yml
+
   # Metrics Configuration
   - name: metrics-port
     short: m
@@ -58,8 +66,55 @@ arguments:
     description: Set the logging level (trace, debug, info, warn, error)
     example: --log-level debug
 
+  # Network Configuration
+  - name: network-port
+    short: p
+    long: network-port
+    type: u16
+    default: 0
+    description: P2P network listening port (0 for random available port)
+    example: --network-port 9000
+
+  - name: bootnode
+    long: bootnode
+    type: string
+    multiple: true
+    description: Bootstrap node multiaddr (can be specified multiple times)
+    example: --bootnode /ip4/127.0.0.1/tcp/9000/p2p/12D3KooWExample
+
+  - name: seed-node
+    long: seed-node
+    type: string
+    multiple: true
+    description: Seed node multiaddr (can be specified multiple times)
+    example: --seed-node /ip4/127.0.0.1/tcp/9001
+
+  - name: topic
+    short: t
+    long: topic
+    type: string
+    multiple: true
+    description: Gossipsub topic to subscribe to (can be specified multiple times)
+    example: --topic mpc-computation
+
+  - name: explicit-peer
+    long: explicit-peer
+    type: string
+    description: Explicit peer ID to add to gossipsub
+    example: --explicit-peer 12D3KooWExample
+
+  - name: identity-key-path
+    long: identity-key-path
+    type: string
+    description: Path to identity key file (will generate new if not provided)
+    example: --identity-key-path ./keys/identity.key
+
 notes:
+  - Configuration priority: CLI args > Config file > Defaults
   - If both enable-jaeger and json-trace are false, standard logging will be used
   - When enable-jaeger is true, jaeger-host and jaeger-port must be provided
   - When json-trace is true, json-trace-file must be provided
   - The RUST_LOG environment variable can override the log-level setting
+  - Network port 0 will use a random available port assigned by the OS
+  - Bootnodes should include the peer ID in the multiaddr
+  - Topics are used for gossipsub pub/sub messaging
