@@ -28,7 +28,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, atomic::AtomicUsize};
 use std::time::Duration;
 
-const PROTOCOL_NAME: &'static str = "/felix/mpc/0.0.0";
+pub const PROTOCOL_NAME: &str = "/felix/mpc/0.0.0";
 pub fn gossip_protocol_name() -> Vec<Cow<'static, [u8]>> {
     vec![PROTOCOL_NAME.as_bytes().into()]
 }

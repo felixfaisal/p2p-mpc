@@ -17,6 +17,10 @@ json_trace_file: traces.json
 # Logging level: trace, debug, info, warn, error
 log_level: info
 
+# RPC configuration
+# JSON-RPC server port (Polkadot-style default)
+rpc_port: 9944
+
 # Network configuration
 # P2P network listening port (0 for random available port)
 network_port: 0

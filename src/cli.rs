@@ -45,6 +45,10 @@ pub struct Config {
 
     #[serde(default)]
     pub identity_key_path: Option<String>,
+
+    // RPC configuration
+    #[serde(default = "default_rpc_port")]
+    pub rpc_port: u16,
 }
 
 fn default_metrics_port() -> u16 {
@@ -65,6 +69,9 @@ fn default_log_level() -> String {
 fn default_network_port() -> u16 {
     0
 } // 0 means random available port
+fn default_rpc_port() -> u16 {
+    9944
+} // Polkadot-style default
 
 impl Default for Config {
     fn default() -> Self {
@@ -82,6 +89,7 @@ impl Default for Config {
             topics: Vec::new(),
             explicit_peer: None,
             identity_key_path: None,
+            rpc_port: default_rpc_port(),
         }
     }
 }
@@ -156,6 +164,11 @@ pub struct Cli {
     /// Path to identity key file (will generate new if not provided)
     #[arg(long)]
     pub identity_key_path: Option<String>,
+
+    // RPC configuration
+    /// JSON-RPC server port
+    #[arg(short = 'r', long)]
+    pub rpc_port: Option<u16>,
 }
 
 impl Cli {
@@ -211,6 +224,11 @@ impl Cli {
         }
         if cli.identity_key_path.is_some() {
             config.identity_key_path = cli.identity_key_path;
+        }
+
+        // RPC configuration overrides
+        if let Some(port) = cli.rpc_port {
+            config.rpc_port = port;
         }
 
         Ok(config)

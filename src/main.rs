@@ -1,12 +1,16 @@
 mod cli;
 mod metrics;
 mod network;
+mod rpc;
 mod tracing_config;
 
 use cli::Cli;
 use libp2p::{PeerId, identity};
 use network::Network;
+use rpc::NetworkInfo;
 use std::fs;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -63,6 +67,24 @@ async fn main() -> anyhow::Result<()> {
 
     let local_peer_id = PeerId::from(local_key.public());
     tracing::info!(target: "GossipNode", "Local peer ID: {}", local_peer_id);
+
+    // Create shared network info for RPC server
+    let network_info = NetworkInfo {
+        peer_id: local_peer_id,
+        listen_addresses: Arc::new(RwLock::new(Vec::new())),
+        peers: Arc::new(RwLock::new(Vec::new())),
+        topics: Arc::new(RwLock::new(config.topics.clone())),
+        protocol_name: network::PROTOCOL_NAME.to_string(),
+    };
+
+    // Start the RPC server in background
+    let rpc_port = config.rpc_port;
+    let rpc_info = network_info.clone();
+    tokio::spawn(async move {
+        if let Err(e) = rpc::start_rpc_server(rpc_port, rpc_info).await {
+            tracing::error!("RPC server error: {}", e);
+        }
+    });
 
     // Initialize P2P network
     let p2p_net = Network::new(local_peer_id, config.network_port, local_key).await;
