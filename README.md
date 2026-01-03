@@ -10,6 +10,12 @@ A peer-to-peer multi-party computation framework built with Rust and libp2p, fea
   - Multiple transport protocols (TCP, WebSocket)
   - Configurable bootstrap and seed nodes
   
+- **JSON-RPC API**: Query network state via RPC
+  - Built with jsonrpsee (Polkadot-style)
+  - Get peer list, topics, protocol info
+  - Query multiaddresses and peer ID
+  - RESTful JSON-RPC 2.0 interface
+
 - **Observability**: Comprehensive monitoring and tracing
   - Prometheus metrics endpoint
   - Jaeger distributed tracing support
@@ -121,6 +127,7 @@ cargo run -- --help
 | `--seed-node` | | Seed nodes (repeatable) | None |
 | `--identity-key-path` | | Path to identity key file | None (ephemeral) |
 | `--metrics-port` | `-m` | Prometheus metrics port | 9090 |
+| `--rpc-port` | `-r` | JSON-RPC server port | 9944 |
 | `--log-level` | `-l` | Logging level | info |
 | `--enable-jaeger` | `-j` | Enable Jaeger tracing | false |
 
@@ -155,9 +162,104 @@ See `cli.yml` for complete documentation of all arguments.
 
 - **`cli.rs`**: CLI argument parsing and configuration management
 - **`network.rs`**: P2P networking logic using libp2p
+- **`rpc.rs`**: JSON-RPC server for network queries
 - **`metrics.rs`**: Prometheus metrics server
 - **`tracing_config.rs`**: Logging and distributed tracing setup
 - **`main.rs`**: Application entry point and orchestration
+
+## JSON-RPC API
+
+The node exposes a JSON-RPC 2.0 API for querying network state (default port: 9944).
+
+### Available Methods
+
+#### `network_getPeerList`
+Get list of connected peers.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_getPeerList","params":[],"id":1}' \
+  http://localhost:9944
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "peers": ["12D3KooWABC...", "12D3KooWXYZ..."],
+    "count": 2
+  },
+  "id": 1
+}
+```
+
+#### `network_getTopicList`
+Get list of subscribed gossipsub topics.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_getTopicList","params":[],"id":1}' \
+  http://localhost:9944
+```
+
+#### `network_getProtocolName`
+Get the protocol name.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_getProtocolName","params":[],"id":1}' \
+  http://localhost:9944
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": "/felix/mpc/0.0.0",
+  "id": 1
+}
+```
+
+#### `network_getPeerId`
+Get the local peer ID.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_getPeerId","params":[],"id":1}' \
+  http://localhost:9944
+```
+
+#### `network_getMultiaddresses`
+Get multiaddresses the node is listening on.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_getMultiaddresses","params":[],"id":1}' \
+  http://localhost:9944
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "addresses": ["/ip4/127.0.0.1/tcp/9000", "/ip4/192.168.1.100/tcp/9000"],
+    "count": 2
+  },
+  "id": 1
+}
+```
+
+### Custom RPC Port
+
+```bash
+# Run with custom RPC port
+cargo run -- --rpc-port 9945
+
+# Or in config file
+rpc_port: 9945
+```
 
 ## Monitoring & Observability
 
@@ -215,6 +317,7 @@ p2p-mpc/
 │   ├── main.rs           # Entry point
 │   ├── cli.rs            # Configuration & CLI
 │   ├── network.rs        # P2P networking
+│   ├── rpc.rs            # JSON-RPC server
 │   ├── metrics.rs        # Prometheus metrics
 │   └── tracing_config.rs # Logging & tracing
 ├── cli.yml               # CLI documentation
@@ -245,6 +348,7 @@ Key dependencies:
 - **libp2p** - P2P networking framework
 - **tokio** - Async runtime
 - **clap** - CLI parsing
+- **jsonrpsee** - JSON-RPC server (Polkadot-style)
 - **prometheus** - Metrics
 - **opentelemetry** - Distributed tracing
 - **tracing** - Logging
@@ -281,11 +385,28 @@ cargo run -- \
 cargo run -- \
   --network-port 9000 \
   --metrics-port 9090 \
+  --rpc-port 9944 \
   --enable-jaeger \
   --jaeger-host localhost \
   --jaeger-port 4317 \
   --log-level debug \
   --topic mpc-test
+```
+
+### Query Network via RPC
+
+```bash
+# Start node
+cargo run -- --network-port 9000 --topic mpc-test --rpc-port 9944
+
+# In another terminal, query the network
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_getPeerId","params":[],"id":1}' \
+  http://localhost:9944
+
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_getPeerList","params":[],"id":1}' \
+  http://localhost:9944
 ```
 
 ## Troubleshooting
@@ -308,6 +429,13 @@ cargo run -- \
 1. Verify the metrics port is not in use
 2. Check firewall allows access to the metrics port
 3. Ensure Prometheus server is accessible at the configured address
+
+### RPC server not responding
+
+1. Check that the RPC port (default 9944) is not in use
+2. Verify firewall allows access to the RPC port
+3. Test with curl to ensure the server is running
+4. Check logs for RPC server errors
 
 ## Roadmap
 
