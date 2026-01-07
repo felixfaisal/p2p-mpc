@@ -23,6 +23,7 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
@@ -31,11 +32,30 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize},
 };
 use std::time::Duration;
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
 
 pub const PROTOCOL_NAME: &str = "/felix/mpc/0.0.0";
 pub fn gossip_protocol_name() -> Vec<Cow<'static, [u8]>> {
     vec![PROTOCOL_NAME.as_bytes().into()]
+}
+
+/// Assignment message types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AssignmentMessage {
+    /// Assignment request from coordinator to peers
+    Request {
+        coordinator_id: String,
+        assignments: std::collections::HashMap<String, usize>,
+        session_id: String,
+    },
+    /// Acceptance response from peer to coordinator
+    Acceptance {
+        peer_id: String,
+        assigned_index: usize,
+        session_id: String,
+    },
 }
 
 /// Commands that can be sent to the network worker
@@ -139,7 +159,8 @@ pub fn build_kademlia(peer_id: PeerId) -> Kademlia<MemoryStore> {
 
 ///builds ping behaviour to be use in swarm
 pub fn build_ping() -> ping::Behaviour {
-    ping::Behaviour::new(ping::Config::new())
+    let config = ping::Config::new().with_interval(Duration::from_secs(30)); // Ping every 30 seconds to keep connection alive
+    ping::Behaviour::new(config)
 }
 
 ///builds kademlia behaviour to be use in swarm
@@ -192,6 +213,12 @@ pub struct Network {
     swarm: Arc<Swarm<LocalNetworkBehaviour>>,
     bootstrapped: Arc<AtomicBool>,
     command_receiver: mpsc::UnboundedReceiver<NetworkCommand>,
+    // Shared state with RPC
+    peer_list: Arc<TokioRwLock<Vec<PeerId>>>,
+    listen_addresses: Arc<TokioRwLock<Vec<Multiaddr>>>,
+    // Session tracking
+    sessions: Arc<TokioRwLock<HashMap<String, crate::rpc::SessionInfo>>>,
+    current_session_id: Arc<TokioRwLock<Option<String>>>,
 }
 
 impl Network {
@@ -199,6 +226,10 @@ impl Network {
         id: PeerId,
         port: u16,
         node_keys: Keypair,
+        peer_list: Arc<TokioRwLock<Vec<PeerId>>>,
+        listen_addresses: Arc<TokioRwLock<Vec<Multiaddr>>>,
+        sessions: Arc<TokioRwLock<HashMap<String, crate::rpc::SessionInfo>>>,
+        current_session_id: Arc<TokioRwLock<Option<String>>>,
     ) -> (Box<Self>, mpsc::UnboundedSender<NetworkCommand>) {
         let transport = create_tcp_transport(node_keys.clone()).await;
         let behaviour = LocalNetworkBehaviour {
@@ -226,6 +257,10 @@ impl Network {
             swarm,
             bootstrapped: Arc::new(AtomicBool::new(false)),
             command_receiver,
+            peer_list,
+            listen_addresses,
+            sessions,
+            current_session_id,
         });
 
         (network, command_sender)
@@ -238,6 +273,124 @@ impl Network {
         self.peers.load(Ordering::Relaxed) >= target
     }
 
+    /// Handle assignment messages (both requests and acceptances)
+    async fn handle_assignment_message(
+        local_peer_id: &PeerId,
+        assignment_msg: AssignmentMessage,
+        swarm: &mut Swarm<LocalNetworkBehaviour>,
+        sessions: &Arc<TokioRwLock<HashMap<String, crate::rpc::SessionInfo>>>,
+    ) {
+        match assignment_msg {
+            AssignmentMessage::Request {
+                coordinator_id,
+                assignments,
+                session_id,
+            } => {
+                // Check if we're in the assignment list
+                let my_id = local_peer_id.to_string();
+                if let Some(&assigned_index) = assignments.get(&my_id) {
+                    // Check if we're the coordinator
+                    if coordinator_id == my_id {
+                        tracing::info!(
+                            target:"GossipNode",
+                            "🎯 Coordinator confirmed own assignment: index {} (total nodes: {})",
+                            assigned_index,
+                            assignments.len()
+                        );
+                        // Coordinator doesn't need to send acceptance to itself
+                        return;
+                    }
+
+                    tracing::info!(
+                        target:"GossipNode",
+                        "🎯 Received assignment from coordinator {}: index {}",
+                        coordinator_id,
+                        assigned_index
+                    );
+
+                    // Send acceptance
+                    let acceptance = AssignmentMessage::Acceptance {
+                        peer_id: my_id,
+                        assigned_index,
+                        session_id: session_id.clone(),
+                    };
+
+                    match serde_json::to_string(&acceptance) {
+                        Ok(json) => {
+                            let topic = Sha256Topic::new("mpc-assignment");
+                            match swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .publish(topic, json.into_bytes())
+                            {
+                                Ok(_) => {
+                                    tracing::info!(
+                                        target:"GossipNode",
+                                        "✅ Sent acceptance for index {} to coordinator",
+                                        assigned_index
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        target:"GossipNode",
+                                        "Failed to send acceptance: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(target:"GossipNode", "Failed to serialize acceptance: {}", e);
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        target:"GossipNode",
+                        "Received assignment but our peer ID not included"
+                    );
+                }
+            }
+            AssignmentMessage::Acceptance {
+                peer_id,
+                assigned_index,
+                session_id,
+            } => {
+                // Update session info with acceptance
+                let mut sessions_map = sessions.write().await;
+                if let Some(session) = sessions_map.get_mut(&session_id) {
+                    session.acceptances.insert(peer_id.clone(), true);
+
+                    let acceptance_count = session.acceptance_count();
+                    let total_expected = session.total_nodes - 1; // Coordinator doesn't send acceptance to itself
+
+                    tracing::info!(
+                        target:"GossipNode",
+                        "✅ Received acceptance from peer {} for index {} (session: {}) - Progress: {}/{}",
+                        peer_id,
+                        assigned_index,
+                        session_id,
+                        acceptance_count,
+                        total_expected
+                    );
+
+                    if session.all_accepted() {
+                        tracing::info!(
+                            target:"GossipNode",
+                            "🎉 All peers accepted their assignments for session {}!",
+                            session_id
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        target:"GossipNode",
+                        "Received acceptance for unknown session: {}",
+                        session_id
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn run(
         mut self,
         topics: impl AsRef<[String]>,
@@ -246,7 +399,15 @@ impl Network {
         explicit_peer: Option<&str>,
     ) -> anyhow::Result<()> {
         tracing::info!(target:"GossipNode","Our id: {}", &self.id.to_string());
-        let mut swarm = Arc::get_mut(&mut self.swarm).expect("Failed to get mutable swarm");
+        let swarm = Arc::get_mut(&mut self.swarm).expect("Failed to get mutable swarm");
+
+        // Always subscribe to the assignment topic
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&Sha256Topic::new("mpc-assignment"))?;
+        tracing::info!(target:"GossipNode","Subscribed to mpc-assignment topic");
+
         for topic in topics.as_ref() {
             swarm
                 .behaviour_mut()
@@ -346,7 +507,7 @@ impl Network {
                     SwarmEvent::Behaviour(NetworkEvent::Gossipsub(gossipsub_event)) => {
                         match gossipsub_event {
                             GossipsubEvent::Message {
-                                propagation_source,
+                                propagation_source: _,
                                 message_id,
                                 message,
                             } => {
@@ -354,16 +515,30 @@ impl Network {
                                 if message.source.as_ref() == Some(&self.id) {
                                     tracing::debug!(target:"GossipNode", "Ignoring our own message: {:?}", message_id);
                                 } else {
-                                    // Log received message
                                     let message_str = String::from_utf8_lossy(&message.data);
-                                    tracing::info!(
-                                        target:"GossipNode",
-                                        "📨 Received message from {:?} on topic '{}': \"{}\" ({} bytes)",
-                                        message.source,
-                                        message.topic,
-                                        message_str,
-                                        message.data.len()
-                                    );
+
+                                    // Check if this is an assignment message
+                                    let assignment_topic = Sha256Topic::new("mpc-assignment");
+                                    if message.topic == assignment_topic.hash() {
+                                        match serde_json::from_str::<AssignmentMessage>(&message_str) {
+                                            Ok(assignment_msg) => {
+                                                Self::handle_assignment_message(&self.id, assignment_msg, swarm, &self.sessions).await;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(target:"GossipNode", "Failed to parse assignment message: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        // Log regular received message
+                                        tracing::info!(
+                                            target:"GossipNode",
+                                            "📨 Received message from {:?} on topic '{}': \"{}\" ({} bytes)",
+                                            message.source,
+                                            message.topic,
+                                            message_str,
+                                            message.data.len()
+                                        );
+                                    }
                                 }
                             }
                             GossipsubEvent::Subscribed { peer_id, topic } => {
@@ -388,20 +563,28 @@ impl Network {
                                 continue;
                             }
 
-                            // Check if this peer already exists in Kademlia's routing table
-                            let is_new_peer = swarm.behaviour_mut().kad.kbucket(peer_id).is_none();
+                            // Add addresses to Kademlia DHT
+                            for address in info.listen_addrs {
+                                swarm.behaviour_mut().kad.add_address(&peer_id, address);
+                            }
+
+                            // Check if this is a new peer in our list
+                            let is_new_peer = {
+                                let peers = self.peer_list.read().await;
+                                !peers.contains(&peer_id)
+                            };
 
                             if is_new_peer {
                                 tracing::info!(target:"GossipNode","New peer identification received: {peer_id}");
 
-                                // Add addresses to Kademlia DHT
-                                for address in info.listen_addrs {
-                                    swarm.behaviour_mut().kad.add_address(&peer_id, address);
-                                }
-
                                 // Increment peer counter only for new peers
                                 let new_peers = self.peers.load(Ordering::Relaxed) + 1;
                                 self.peers.store(new_peers, Ordering::Relaxed);
+
+                                // Update shared peer list for RPC
+                                let mut peers = self.peer_list.write().await;
+                                peers.push(peer_id);
+                                tracing::info!(target:"GossipNode","Added peer {} to shared peer list", peer_id);
 
                                 // Bootstrap Kademlia if not already done
                                 if !self.bootstrapped.load(Ordering::Relaxed) {
@@ -427,10 +610,10 @@ impl Network {
                         },
                     },
                     SwarmEvent::Behaviour(NetworkEvent::Kad(event)) => match event {
-                        libp2p::kad::KademliaEvent::InboundRequest { request } => {
+                        libp2p::kad::KademliaEvent::InboundRequest { request: _ } => {
                             tracing::debug!(target:"GossipNode", "Kademlia inbound request received");
                         }
-                        libp2p::kad::KademliaEvent::OutboundQueryCompleted { id, result, stats } => {
+                        libp2p::kad::KademliaEvent::OutboundQueryCompleted { id: _, result, stats: _ } => {
                             tracing::debug!(target:"GossipNode", "Kademlia query completed: {:?}", result);
 
                             // Check if this was a bootstrap query
@@ -475,8 +658,28 @@ impl Network {
                         }
                     },
                     // TODO: Ping event handle
-                    SwarmEvent::Behaviour(NetworkEvent::Ping(event)) => {
+                    SwarmEvent::Behaviour(NetworkEvent::Ping(_event)) => {
                         tracing::debug!(target:"GossipNode","Ping event received");
+                    },
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        tracing::info!(target:"GossipNode", "Listening on {}", address);
+                        // Update shared listen addresses for RPC
+                        let mut addrs = self.listen_addresses.write().await;
+                        if !addrs.contains(&address) {
+                            addrs.push(address);
+                        }
+                    },
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        tracing::info!(target:"GossipNode", "Connection established with peer: {}", peer_id);
+                    },
+                    SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                        tracing::info!(target:"GossipNode", "Connection closed with peer {}: {:?}", peer_id, cause);
+                        // Remove peer from shared list
+                        let mut peers = self.peer_list.write().await;
+                        peers.retain(|p| p != &peer_id);
+                        let count = self.peers.load(Ordering::Relaxed).saturating_sub(1);
+                        self.peers.store(count, Ordering::Relaxed);
+                        tracing::debug!(target:"GossipNode", "Removed peer {} from shared peer list", peer_id);
                     },
                     // TODO: implement events handling
                     _ => tracing::debug!(target:"GossipNode","Got new event from network"),
