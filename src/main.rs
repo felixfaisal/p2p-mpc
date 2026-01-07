@@ -68,6 +68,10 @@ async fn main() -> anyhow::Result<()> {
     let local_peer_id = PeerId::from(local_key.public());
     tracing::info!(target: "GossipNode", "Local peer ID: {}", local_peer_id);
 
+    // Initialize P2P network
+    let (p2p_net, network_command_sender) =
+        Network::new(local_peer_id, config.network_port, local_key).await;
+
     // Create shared network info for RPC server
     let network_info = NetworkInfo {
         peer_id: local_peer_id,
@@ -75,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         peers: Arc::new(RwLock::new(Vec::new())),
         topics: Arc::new(RwLock::new(config.topics.clone())),
         protocol_name: network::PROTOCOL_NAME.to_string(),
+        network_command_sender: network_command_sender.clone(),
     };
 
     // Start the RPC server in background
@@ -86,10 +91,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Initialize P2P network
-    let p2p_net = Network::new(local_peer_id, config.network_port, local_key).await;
-
     tracing::info!(target: "GossipNode", "Starting network on port {}", config.network_port);
+    tracing::info!(target: "GossipNode", "Network command channel ready for broadcasting messages");
 
     // Run the network with configuration
     p2p_net
