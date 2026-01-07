@@ -251,6 +251,33 @@ Response:
 }
 ```
 
+#### `network_broadcast`
+Broadcast a message to a gossipsub topic.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_broadcast","params":["mpc-test","Hello, P2P network!"],"id":1}' \
+  http://localhost:9944
+```
+
+Parameters:
+- `topic` (string): The gossipsub topic to broadcast to
+- `message` (string): The message content to broadcast
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "success": true,
+    "message": "Message broadcast to topic 'mpc-test' initiated"
+  },
+  "id": 1
+}
+```
+
+**Note:** Both nodes must be subscribed to the same topic to receive the broadcast. The sending node will not receive its own message.
+
 ### Custom RPC Port
 
 ```bash

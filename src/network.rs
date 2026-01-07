@@ -21,16 +21,34 @@ use libp2p::{
     ping,
     swarm::Swarm,
 };
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize},
+};
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 pub const PROTOCOL_NAME: &str = "/felix/mpc/0.0.0";
 pub fn gossip_protocol_name() -> Vec<Cow<'static, [u8]>> {
     vec![PROTOCOL_NAME.as_bytes().into()]
+}
+
+/// Commands that can be sent to the network worker
+#[derive(Debug)]
+pub enum NetworkCommand {
+    /// Broadcast a message to a specific topic
+    Broadcast { topic: String, data: Vec<u8> },
+    /// Subscribe to a new topic
+    Subscribe { topic: String },
+    /// Unsubscribe from a topic
+    Unsubscribe { topic: String },
+    /// Dial a specific peer
+    Dial { address: Multiaddr },
 }
 
 pub struct Networker {
@@ -172,10 +190,16 @@ pub struct Network {
     pub peers: Arc<AtomicUsize>,
     node_keys: Keypair,
     swarm: Arc<Swarm<LocalNetworkBehaviour>>,
+    bootstrapped: Arc<AtomicBool>,
+    command_receiver: mpsc::UnboundedReceiver<NetworkCommand>,
 }
 
 impl Network {
-    pub async fn new(id: PeerId, port: u16, node_keys: Keypair) -> Box<Self> {
+    pub async fn new(
+        id: PeerId,
+        port: u16,
+        node_keys: Keypair,
+    ) -> (Box<Self>, mpsc::UnboundedSender<NetworkCommand>) {
         let transport = create_tcp_transport(node_keys.clone()).await;
         let behaviour = LocalNetworkBehaviour {
             gossipsub: build_gossip(node_keys.clone()).expect("Incorrect keys provided"),
@@ -190,13 +214,21 @@ impl Network {
                 }))
                 .build(),
         );
-        Box::new(Network {
+
+        // Create command channel
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
+
+        let network = Box::new(Network {
             id,
             port,
             peers: Arc::new(AtomicUsize::new(0)),
             node_keys,
             swarm,
-        })
+            bootstrapped: Arc::new(AtomicBool::new(false)),
+            command_receiver,
+        });
+
+        (network, command_sender)
     }
 
     /// Returns `true` if number of all swarm's gossip_sub peers greater or equal to target
@@ -251,39 +283,196 @@ impl Network {
                 .kad
                 .add_address(&peer_id, address.clone());
             swarm.dial(address)?;
-            // self.bootstrapped.store(true, Ordering::Relaxed);
+            self.bootstrapped.store(true, Ordering::Relaxed);
         }
-        // if self.bootstrapped.load(Ordering::Relaxed) {
-        //     swarm.behaviour_mut().kademlia.bootstrap()?;
-        // }
+        if self.bootstrapped.load(Ordering::Relaxed) {
+            if let Err(e) = swarm.behaviour_mut().kad.bootstrap() {
+                tracing::warn!("Failed to bootstrap Kademlia: {:?}", e);
+            } else {
+                tracing::info!("Kademlia bootstrap initiated");
+            }
+        }
         loop {
             tokio::select! {
+                // Handle commands from the command channel
+                Some(command) = self.command_receiver.recv() => {
+                    match command {
+                        NetworkCommand::Broadcast { topic, data } => {
+                            let topic = Sha256Topic::new(topic);
+                            match swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
+                                Ok(message_id) => {
+                                    tracing::info!(target:"GossipNode", "Published message {:?} to topic: {}", message_id, topic);
+                                }
+                                Err(e) => {
+                                    tracing::error!(target:"GossipNode", "Failed to publish message to topic {}: {:?}", topic, e);
+                                }
+                            }
+                        }
+                        NetworkCommand::Subscribe { topic } => {
+                            let topic = Sha256Topic::new(topic);
+                            match swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+                                Ok(_) => {
+                                    tracing::info!(target:"GossipNode", "Subscribed to topic: {}", topic);
+                                }
+                                Err(e) => {
+                                    tracing::error!(target:"GossipNode", "Failed to subscribe to topic {}: {:?}", topic, e);
+                                }
+                            }
+                        }
+                        NetworkCommand::Unsubscribe { topic } => {
+                            let topic = Sha256Topic::new(topic);
+                            match swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
+                                Ok(_) => {
+                                    tracing::info!(target:"GossipNode", "Unsubscribed from topic: {}", topic);
+                                }
+                                Err(e) => {
+                                    tracing::error!(target:"GossipNode", "Failed to unsubscribe from topic {}: {:?}", topic, e);
+                                }
+                            }
+                        }
+                        NetworkCommand::Dial { address } => {
+                            match swarm.dial(address.clone()) {
+                                Ok(_) => {
+                                    tracing::info!(target:"GossipNode", "Dialing peer at: {}", address);
+                                }
+                                Err(e) => {
+                                    tracing::error!(target:"GossipNode", "Failed to dial {}: {:?}", address, e);
+                                }
+                            }
+                        }
+                    }
+                }
                 event = swarm.select_next_some() => match event {
-                    SwarmEvent::Behaviour(NetworkEvent::Gossipsub(msg)) => {
-                        // Handle GossipSub message
+                    SwarmEvent::Behaviour(NetworkEvent::Gossipsub(gossipsub_event)) => {
+                        match gossipsub_event {
+                            GossipsubEvent::Message {
+                                propagation_source,
+                                message_id,
+                                message,
+                            } => {
+                                // Filter out our own messages
+                                if message.source.as_ref() == Some(&self.id) {
+                                    tracing::debug!(target:"GossipNode", "Ignoring our own message: {:?}", message_id);
+                                } else {
+                                    // Log received message
+                                    let message_str = String::from_utf8_lossy(&message.data);
+                                    tracing::info!(
+                                        target:"GossipNode",
+                                        "📨 Received message from {:?} on topic '{}': \"{}\" ({} bytes)",
+                                        message.source,
+                                        message.topic,
+                                        message_str,
+                                        message.data.len()
+                                    );
+                                }
+                            }
+                            GossipsubEvent::Subscribed { peer_id, topic } => {
+                                tracing::info!(target:"GossipNode", "Peer {} subscribed to topic: {}", peer_id, topic);
+                            }
+                            GossipsubEvent::Unsubscribed { peer_id, topic } => {
+                                tracing::info!(target:"GossipNode", "Peer {} unsubscribed from topic: {}", peer_id, topic);
+                            }
+                            _ => {
+                                tracing::debug!(target:"GossipNode", "Other gossipsub event: {:?}", gossipsub_event);
+                            }
+                        }
                     },
                     SwarmEvent::OutgoingConnectionError {peer_id, ..} => if let Some(pid) = peer_id {
                         tracing::info!(target:"GossipNode","Peer with id {pid} exited.");
                     },
                     SwarmEvent::Behaviour(NetworkEvent::Identify(event)) => match event {
                         identify::Event::Received { peer_id, info } => {
-                            for address in info.listen_addrs {
-                                swarm.behaviour_mut().kad.add_address(&peer_id, address.clone());
-                                swarm.dial(address)?;
+                            // Filter out our own identify events
+                            if peer_id == self.id {
+                                tracing::debug!(target:"GossipNode","Ignoring identify event from ourselves");
+                                continue;
                             }
-                            // if !self.bootstrapped.load(Ordering::Relaxed) {
-                            //     swarm.behaviour_mut().kademlia.bootstrap()?;
-                            //     self.bootstrapped.store(true, Ordering::Relaxed);
-                            //     log::info!(target: "bootnode", "Bootstrapped");
-                            // }
-                            tracing::info!(target:"GossipNode","New peer identification received: {peer_id}");
-                            let new_peers = self.peers.load(Ordering::Relaxed) + 1;
-                            self.peers.store(new_peers, Ordering::Relaxed);
+
+                            // Check if this peer already exists in Kademlia's routing table
+                            let is_new_peer = swarm.behaviour_mut().kad.kbucket(peer_id).is_none();
+
+                            if is_new_peer {
+                                tracing::info!(target:"GossipNode","New peer identification received: {peer_id}");
+
+                                // Add addresses to Kademlia DHT
+                                for address in info.listen_addrs {
+                                    swarm.behaviour_mut().kad.add_address(&peer_id, address);
+                                }
+
+                                // Increment peer counter only for new peers
+                                let new_peers = self.peers.load(Ordering::Relaxed) + 1;
+                                self.peers.store(new_peers, Ordering::Relaxed);
+
+                                // Bootstrap Kademlia if not already done
+                                if !self.bootstrapped.load(Ordering::Relaxed) {
+                                    if let Err(e) = swarm.behaviour_mut().kad.bootstrap() {
+                                        tracing::warn!("Failed to bootstrap Kademlia: {:?}", e);
+                                    } else {
+                                        self.bootstrapped.store(true, Ordering::Relaxed);
+                                        tracing::info!(target: "GossipNode", "Kademlia bootstrap initiated");
+                                    }
+                                }
+                            } else {
+                                tracing::debug!(target:"GossipNode","Identify update from known peer: {peer_id}");
+                            }
                         },
-                        _ => tracing::debug!(target:"GossipNode","Other Identify event received? :>")
+                        identify::Event::Sent { peer_id } => {
+                            tracing::debug!(target:"GossipNode","Sent identify info to peer: {peer_id}");
+                        },
+                        identify::Event::Pushed { peer_id } => {
+                            tracing::debug!(target:"GossipNode","Pushed identify info to peer: {peer_id}");
+                        },
+                        identify::Event::Error { peer_id, error } => {
+                            tracing::warn!(target:"GossipNode","Identify error with peer {peer_id:?}: {error}");
+                        },
                     },
-                    SwarmEvent::Behaviour(NetworkEvent::Kad(event)) => {
-                        tracing::debug!(target:"GossipNode","Kademlia event received.");
+                    SwarmEvent::Behaviour(NetworkEvent::Kad(event)) => match event {
+                        libp2p::kad::KademliaEvent::InboundRequest { request } => {
+                            tracing::debug!(target:"GossipNode", "Kademlia inbound request received");
+                        }
+                        libp2p::kad::KademliaEvent::OutboundQueryCompleted { id, result, stats } => {
+                            tracing::debug!(target:"GossipNode", "Kademlia query completed: {:?}", result);
+
+                            // Check if this was a bootstrap query
+                            match result {
+                                libp2p::kad::QueryResult::Bootstrap(Ok(bootstrap_ok)) => {
+                                    tracing::info!(target:"GossipNode",
+                                        "Kademlia bootstrap successful! Discovered {} peers",
+                                        bootstrap_ok.num_remaining
+                                    );
+                                }
+                                libp2p::kad::QueryResult::Bootstrap(Err(e)) => {
+                                    tracing::warn!(target:"GossipNode", "Kademlia bootstrap failed: {:?}", e);
+                                }
+                                _ => {
+                                    tracing::debug!(target:"GossipNode", "Other query completed: {:?}", result);
+                                }
+                            }
+                        }
+                        libp2p::kad::KademliaEvent::RoutingUpdated {
+                            peer,
+                            is_new_peer,
+                            old_peer,
+                            ..
+                        } => {
+                            if is_new_peer {
+                                tracing::info!(target:"GossipNode", "New peer added to routing table: {}", peer);
+                            } else {
+                                tracing::debug!(target:"GossipNode", "Routing table updated for peer: {}", peer);
+                            }
+                            if let Some(evicted) = old_peer {
+                                tracing::debug!(target:"GossipNode", "Peer {} evicted from routing table", evicted);
+                            }
+                        }
+                        libp2p::kad::KademliaEvent::UnroutablePeer { peer } => {
+                            tracing::debug!(target:"GossipNode", "Unroutable peer (no listen address): {}", peer);
+                        }
+                        libp2p::kad::KademliaEvent::RoutablePeer { peer, address } => {
+                            tracing::debug!(target:"GossipNode", "Routable peer found: {} at {}", peer, address);
+                        }
+                        libp2p::kad::KademliaEvent::PendingRoutablePeer { peer, address } => {
+                            tracing::debug!(target:"GossipNode", "Pending routable peer: {} at {}", peer, address);
+                        }
                     },
                     // TODO: Ping event handle
                     SwarmEvent::Behaviour(NetworkEvent::Ping(event)) => {

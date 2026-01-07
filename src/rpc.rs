@@ -1,3 +1,4 @@
+use crate::network::NetworkCommand;
 use jsonrpsee::{
     core::{RpcResult, async_trait},
     proc_macros::rpc,
@@ -6,7 +7,7 @@ use jsonrpsee::{
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 /// Network information shared with RPC server
 #[derive(Clone)]
@@ -16,6 +17,7 @@ pub struct NetworkInfo {
     pub peers: Arc<RwLock<Vec<PeerId>>>,
     pub topics: Arc<RwLock<Vec<String>>>,
     pub protocol_name: String,
+    pub network_command_sender: mpsc::UnboundedSender<NetworkCommand>,
 }
 
 /// Response structure for peer list
@@ -37,6 +39,13 @@ pub struct TopicListResponse {
 pub struct MultiaddressResponse {
     pub addresses: Vec<String>,
     pub count: usize,
+}
+
+/// Response structure for broadcast operation
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BroadcastResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 /// RPC API definition
@@ -61,6 +70,10 @@ pub trait NetworkRpc {
     /// Get multiaddresses the node is listening on
     #[method(name = "network_getMultiaddresses")]
     async fn get_multiaddresses(&self) -> RpcResult<MultiaddressResponse>;
+
+    /// Broadcast a message to a gossipsub topic
+    #[method(name = "network_broadcast")]
+    async fn broadcast(&self, topic: String, message: String) -> RpcResult<BroadcastResponse>;
 }
 
 /// RPC server implementation
@@ -115,6 +128,33 @@ impl NetworkRpcServer for NetworkRpcImpl {
             addresses: addr_strings,
             count,
         })
+    }
+
+    async fn broadcast(&self, topic: String, message: String) -> RpcResult<BroadcastResponse> {
+        let data = message.into_bytes();
+
+        match self
+            .info
+            .network_command_sender
+            .send(NetworkCommand::Broadcast {
+                topic: topic.clone(),
+                data,
+            }) {
+            Ok(_) => {
+                tracing::info!(target: "RpcServer", "Broadcast request sent for topic: {}", topic);
+                Ok(BroadcastResponse {
+                    success: true,
+                    message: format!("Message broadcast to topic '{}' initiated", topic),
+                })
+            }
+            Err(e) => {
+                tracing::error!(target: "RpcServer", "Failed to send broadcast command: {}", e);
+                Ok(BroadcastResponse {
+                    success: false,
+                    message: format!("Failed to broadcast: {}", e),
+                })
+            }
+        }
     }
 }
 
