@@ -279,6 +279,7 @@ impl Network {
         assignment_msg: AssignmentMessage,
         swarm: &mut Swarm<LocalNetworkBehaviour>,
         sessions: &Arc<TokioRwLock<HashMap<String, crate::rpc::SessionInfo>>>,
+        current_session_id: &Arc<TokioRwLock<Option<String>>>,
     ) {
         match assignment_msg {
             AssignmentMessage::Request {
@@ -289,6 +290,25 @@ impl Network {
                 // Check if we're in the assignment list
                 let my_id = local_peer_id.to_string();
                 if let Some(&assigned_index) = assignments.get(&my_id) {
+                    // Update current session ID to track which session we're participating in
+                    {
+                        let mut current = current_session_id.write().await;
+                        *current = Some(session_id.clone());
+                    }
+
+                    // Store session info locally
+                    {
+                        let mut sessions_map = sessions.write().await;
+                        if !sessions_map.contains_key(&session_id) {
+                            let session_info = crate::rpc::SessionInfo::new(
+                                session_id.clone(),
+                                coordinator_id.clone(),
+                                assignments.clone(),
+                            );
+                            sessions_map.insert(session_id.clone(), session_info);
+                        }
+                    }
+
                     // Check if we're the coordinator
                     if coordinator_id == my_id {
                         tracing::info!(
@@ -522,7 +542,7 @@ impl Network {
                                     if message.topic == assignment_topic.hash() {
                                         match serde_json::from_str::<AssignmentMessage>(&message_str) {
                                             Ok(assignment_msg) => {
-                                                Self::handle_assignment_message(&self.id, assignment_msg, swarm, &self.sessions).await;
+                                                Self::handle_assignment_message(&self.id, assignment_msg, swarm, &self.sessions, &self.current_session_id).await;
                                             }
                                             Err(e) => {
                                                 tracing::warn!(target:"GossipNode", "Failed to parse assignment message: {}", e);
