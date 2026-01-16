@@ -65,6 +65,8 @@ pub struct NetworkInfo {
     // Session management
     pub sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
     pub current_session_id: Arc<RwLock<Option<String>>>,
+    // MPC Orchestrator
+    pub mpc_orchestrator: Arc<RwLock<Option<crate::mpc::MPCOrchestrator>>>,
 }
 
 /// Response structure for peer list
@@ -119,6 +121,14 @@ pub struct SessionStatusResponse {
     pub message: String,
 }
 
+/// Response structure for MPC aux generation initiation
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InitiateAuxGenResponse {
+    pub success: bool,
+    pub message: String,
+    pub execution_id: Option<String>,
+}
+
 /// RPC API definition
 #[rpc(server)]
 pub trait NetworkRpc {
@@ -156,6 +166,10 @@ pub trait NetworkRpc {
         &self,
         session_id: Option<String>,
     ) -> RpcResult<SessionStatusResponse>;
+
+    /// Initiate MPC aux generation phase
+    #[method(name = "mpc_initiateAuxGen")]
+    async fn initiate_aux_gen(&self) -> RpcResult<InitiateAuxGenResponse>;
 }
 
 /// RPC server implementation
@@ -426,6 +440,110 @@ impl NetworkRpcServer for NetworkRpcImpl {
                 all_accepted: false,
                 created_at: 0,
                 message: format!("Session '{}' not found", target_session_id),
+            }),
+        }
+    }
+
+    async fn initiate_aux_gen(&self) -> RpcResult<InitiateAuxGenResponse> {
+        use std::time::SystemTime;
+
+        // Check if orchestrator is initialized
+        let mut orchestrator_lock = self.info.mpc_orchestrator.write().await;
+        let orchestrator = match orchestrator_lock.as_mut() {
+            Some(orch) => orch,
+            None => {
+                return Ok(InitiateAuxGenResponse {
+                    success: false,
+                    message: "MPC orchestrator not initialized. Please assign peer indices first."
+                        .to_string(),
+                    execution_id: None,
+                });
+            }
+        };
+
+        // Get orchestrator state
+        let state = orchestrator.get_state().await;
+
+        // Verify we're in Idle state
+        match state {
+            crate::mpc::ProtocolState::Idle => {
+                // Good to proceed
+            }
+            _ => {
+                return Ok(InitiateAuxGenResponse {
+                    success: false,
+                    message: format!("Cannot initiate aux generation. Current state: {:?}", state),
+                    execution_id: None,
+                });
+            }
+        }
+
+        // Create execution ID
+        let timestamp = SystemTime::now();
+        let execution_id = orchestrator.create_execution_id("aux", timestamp);
+        let execution_id_hex = hex::encode(&execution_id);
+
+        // Get participants and party assignments from orchestrator
+        let participants = orchestrator.participants.clone();
+        let party_assignments = orchestrator.party_assignments.clone();
+
+        // Create InitiateAux coordination message
+        let coord_message = crate::mpc::CoordinationMessage::InitiateAux {
+            execution_id: execution_id.clone(),
+            participants: participants.clone(),
+            party_assignments: party_assignments.clone(),
+            timestamp,
+        };
+
+        // Serialize and broadcast via P2P
+        match serde_json::to_string(&coord_message) {
+            Ok(json) => {
+                let data = json.into_bytes();
+                match self.info.network_command_sender.send(
+                    crate::network::NetworkCommand::Broadcast {
+                        topic: crate::network::MPC_COORDINATION_TOPIC.to_string(),
+                        data,
+                    },
+                ) {
+                    Ok(_) => {
+                        tracing::info!(
+                            "📡 Broadcasted InitiateAux message (execution_id: {})",
+                            execution_id_hex
+                        );
+
+                        // Handle the message locally as well (self-message)
+                        if let Err(e) = orchestrator
+                            .handle_coordination_message(self.info.peer_id, coord_message)
+                            .await
+                        {
+                            tracing::error!("Failed to handle local aux initiation: {:?}", e);
+                            return Ok(InitiateAuxGenResponse {
+                                success: false,
+                                message: format!("Failed to process locally: {}", e),
+                                execution_id: Some(execution_id_hex),
+                            });
+                        }
+
+                        Ok(InitiateAuxGenResponse {
+                            success: true,
+                            message: format!(
+                                "Aux generation initiated with {} participants",
+                                participants.len()
+                            ),
+                            execution_id: Some(execution_id_hex),
+                        })
+                    }
+                    Err(e) => Ok(InitiateAuxGenResponse {
+                        success: false,
+                        message: format!("Failed to broadcast message: {}", e),
+                        execution_id: Some(execution_id_hex),
+                    }),
+                }
+            }
+            Err(e) => Ok(InitiateAuxGenResponse {
+                success: false,
+                message: format!("Failed to serialize coordination message: {}", e),
+                execution_id: None,
             }),
         }
     }

@@ -35,7 +35,12 @@ use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
 
+use crate::mpc::{CoordinationMessage, MPCOrchestrator};
+
 pub const PROTOCOL_NAME: &str = "/felix/mpc/0.0.0";
+pub const MPC_COORDINATION_TOPIC: &str = "mpc-coordination";
+pub const MPC_ASSIGNMENT_TOPIC: &str = "mpc-assignment";
+
 pub fn gossip_protocol_name() -> Vec<Cow<'static, [u8]>> {
     vec![PROTOCOL_NAME.as_bytes().into()]
 }
@@ -159,7 +164,7 @@ pub fn build_kademlia(peer_id: PeerId) -> Kademlia<MemoryStore> {
 
 ///builds ping behaviour to be use in swarm
 pub fn build_ping() -> ping::Behaviour {
-    let config = ping::Config::new().with_interval(Duration::from_secs(30)); // Ping every 30 seconds to keep connection alive
+    let config = ping::Config::new().with_interval(Duration::from_secs(10)); // Ping every 30 seconds to keep connection alive
     ping::Behaviour::new(config)
 }
 
@@ -219,6 +224,8 @@ pub struct Network {
     // Session tracking
     sessions: Arc<TokioRwLock<HashMap<String, crate::rpc::SessionInfo>>>,
     current_session_id: Arc<TokioRwLock<Option<String>>>,
+    // MPC Orchestrator
+    mpc_orchestrator: Arc<TokioRwLock<Option<MPCOrchestrator>>>,
 }
 
 impl Network {
@@ -230,7 +237,11 @@ impl Network {
         listen_addresses: Arc<TokioRwLock<Vec<Multiaddr>>>,
         sessions: Arc<TokioRwLock<HashMap<String, crate::rpc::SessionInfo>>>,
         current_session_id: Arc<TokioRwLock<Option<String>>>,
-    ) -> (Box<Self>, mpsc::UnboundedSender<NetworkCommand>) {
+    ) -> (
+        Box<Self>,
+        mpsc::UnboundedSender<NetworkCommand>,
+        Arc<TokioRwLock<Option<MPCOrchestrator>>>,
+    ) {
         let transport = create_tcp_transport(node_keys.clone()).await;
         let behaviour = LocalNetworkBehaviour {
             gossipsub: build_gossip(node_keys.clone()).expect("Incorrect keys provided"),
@@ -249,6 +260,9 @@ impl Network {
         // Create command channel
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
+        // Create shared mpc_orchestrator
+        let mpc_orchestrator = Arc::new(TokioRwLock::new(None));
+
         let network = Box::new(Network {
             id,
             port,
@@ -261,9 +275,10 @@ impl Network {
             listen_addresses,
             sessions,
             current_session_id,
+            mpc_orchestrator: mpc_orchestrator.clone(),
         });
 
-        (network, command_sender)
+        (network, command_sender, mpc_orchestrator)
     }
 
     /// Returns `true` if number of all swarm's gossip_sub peers greater or equal to target
@@ -280,6 +295,7 @@ impl Network {
         swarm: &mut Swarm<LocalNetworkBehaviour>,
         sessions: &Arc<TokioRwLock<HashMap<String, crate::rpc::SessionInfo>>>,
         current_session_id: &Arc<TokioRwLock<Option<String>>>,
+        mpc_orchestrator: &Arc<TokioRwLock<Option<MPCOrchestrator>>>,
     ) {
         match assignment_msg {
             AssignmentMessage::Request {
@@ -349,6 +365,50 @@ impl Network {
                                         "✅ Sent acceptance for index {} to coordinator",
                                         assigned_index
                                     );
+
+                                    // Initialize MPC Orchestrator after accepting assignment
+                                    // Convert String peer IDs to PeerId and usize indices to u16
+                                    let mut party_assignments: HashMap<PeerId, u16> =
+                                        HashMap::new();
+                                    let mut participants: Vec<PeerId> = Vec::new();
+
+                                    for (peer_id_str, &index) in &assignments {
+                                        match peer_id_str.parse::<PeerId>() {
+                                            Ok(peer_id) => {
+                                                party_assignments.insert(peer_id, index as u16);
+                                                participants.push(peer_id);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    target:"GossipNode",
+                                                    "Failed to parse peer ID '{}': {}",
+                                                    peer_id_str,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // Sort participants for deterministic ordering
+                                    participants.sort();
+
+                                    // Create orchestrator with default 5-minute timeout
+                                    let orchestrator = MPCOrchestrator::new(
+                                        *local_peer_id,
+                                        participants.clone(),
+                                        party_assignments.clone(),
+                                        Duration::from_secs(300),
+                                    );
+
+                                    // Store orchestrator
+                                    let mut orch_lock = mpc_orchestrator.write().await;
+                                    *orch_lock = Some(orchestrator);
+
+                                    tracing::info!(
+                                        target:"GossipNode",
+                                        "✅ Non-coordinator initialized MPC Orchestrator with {} participants (state: Idle)",
+                                        participants.len()
+                                    );
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -399,6 +459,54 @@ impl Network {
                             "🎉 All peers accepted their assignments for session {}!",
                             session_id
                         );
+
+                        // Clone assignments before dropping the lock
+                        let assignments_clone = session.assignments.clone();
+
+                        // Initialize MPC Orchestrator after all assignments are accepted
+                        drop(sessions_map); // Release lock before async operation
+
+                        // Convert String peer IDs to PeerId and usize indices to u16
+                        let mut party_assignments: HashMap<PeerId, u16> = HashMap::new();
+                        let mut participants: Vec<PeerId> = Vec::new();
+
+                        for (peer_id_str, &index) in &assignments_clone {
+                            match peer_id_str.parse::<PeerId>() {
+                                Ok(peer_id) => {
+                                    party_assignments.insert(peer_id, index as u16);
+                                    participants.push(peer_id);
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        target:"GossipNode",
+                                        "Failed to parse peer ID '{}': {}",
+                                        peer_id_str,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+
+                        // Sort participants for deterministic ordering
+                        participants.sort();
+
+                        // Create orchestrator with default 5-minute timeout
+                        let orchestrator = MPCOrchestrator::new(
+                            *local_peer_id,
+                            participants.clone(),
+                            party_assignments.clone(),
+                            Duration::from_secs(300),
+                        );
+
+                        // Store orchestrator
+                        let mut orch_lock = mpc_orchestrator.write().await;
+                        *orch_lock = Some(orchestrator);
+
+                        tracing::info!(
+                            target:"GossipNode",
+                            "✅ Initialized MPC Orchestrator with {} participants (state: Idle)",
+                            participants.len()
+                        );
                     }
                 } else {
                     tracing::warn!(
@@ -421,12 +529,18 @@ impl Network {
         tracing::info!(target:"GossipNode","Our id: {}", &self.id.to_string());
         let swarm = Arc::get_mut(&mut self.swarm).expect("Failed to get mutable swarm");
 
-        // Always subscribe to the assignment topic
+        // Always subscribe to the assignment and coordination topics
         swarm
             .behaviour_mut()
             .gossipsub
-            .subscribe(&Sha256Topic::new("mpc-assignment"))?;
+            .subscribe(&Sha256Topic::new(MPC_ASSIGNMENT_TOPIC))?;
         tracing::info!(target:"GossipNode","Subscribed to mpc-assignment topic");
+
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&Sha256Topic::new(MPC_COORDINATION_TOPIC))?;
+        tracing::info!(target:"GossipNode","Subscribed to mpc-coordination topic");
 
         for topic in topics.as_ref() {
             swarm
@@ -538,14 +652,51 @@ impl Network {
                                     let message_str = String::from_utf8_lossy(&message.data);
 
                                     // Check if this is an assignment message
-                                    let assignment_topic = Sha256Topic::new("mpc-assignment");
+                                    let assignment_topic = Sha256Topic::new(MPC_ASSIGNMENT_TOPIC);
+                                    let coordination_topic = Sha256Topic::new(MPC_COORDINATION_TOPIC);
+
                                     if message.topic == assignment_topic.hash() {
                                         match serde_json::from_str::<AssignmentMessage>(&message_str) {
                                             Ok(assignment_msg) => {
-                                                Self::handle_assignment_message(&self.id, assignment_msg, swarm, &self.sessions, &self.current_session_id).await;
+                                                Self::handle_assignment_message(&self.id, assignment_msg, swarm, &self.sessions, &self.current_session_id, &self.mpc_orchestrator).await;
                                             }
                                             Err(e) => {
                                                 tracing::warn!(target:"GossipNode", "Failed to parse assignment message: {}", e);
+                                            }
+                                        }
+                                    } else if message.topic == coordination_topic.hash() {
+                                        // Handle MPC coordination messages inline to avoid borrow conflicts
+                                        match serde_json::from_str::<CoordinationMessage>(&message_str) {
+                                            Ok(coord_msg) => {
+                                                if let Some(source) = message.source {
+                                                    tracing::info!(
+                                                        target:"GossipNode",
+                                                        "📡 Received MPC coordination message from {}: {:?}",
+                                                        source,
+                                                        coord_msg
+                                                    );
+
+                                                    // Get mutable access to orchestrator
+                                                    let mut orchestrator_lock = self.mpc_orchestrator.write().await;
+                                                    if let Some(orchestrator) = orchestrator_lock.as_mut() {
+                                                        if let Err(e) = orchestrator.handle_coordination_message(source, coord_msg).await {
+                                                            tracing::error!(
+                                                                target:"GossipNode",
+                                                                "Failed to handle MPC coordination message from {}: {:?}",
+                                                                source,
+                                                                e
+                                                            );
+                                                        }
+                                                    } else {
+                                                        tracing::warn!(
+                                                            target:"GossipNode",
+                                                            "Received MPC coordination message but orchestrator not initialized"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(target:"GossipNode", "Failed to parse MPC coordination message: {}", e);
                                             }
                                         }
                                     } else {

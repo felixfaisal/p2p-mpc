@@ -20,10 +20,10 @@ pub struct MPCOrchestrator {
     state: Arc<Mutex<ProtocolState>>,
 
     /// List of participating peers
-    participants: Vec<PeerId>,
+    pub participants: Vec<PeerId>,
 
     /// Mapping from PeerId to PartyIndex (stable assignment)
-    party_assignments: HashMap<PeerId, PartyIndex>,
+    pub party_assignments: HashMap<PeerId, PartyIndex>,
 
     /// Timeout duration for each protocol phase
     timeout: Duration,
@@ -270,7 +270,7 @@ impl MPCOrchestrator {
         // TODO: Update state to AuxGeneration
         // TODO: Spawn aux generation task (call separate function)
 
-        tracing::info!("TODO: Handle InitiateAux from {}", from);
+        tracing::warn!("TODO: Handle InitiateAux from {}", from);
         Ok(())
     }
 
@@ -415,7 +415,7 @@ impl MPCOrchestrator {
     // ========================================================================
 
     /// Create a deterministic execution ID from phase and timestamp
-    fn create_execution_id(&self, phase: &str, timestamp: SystemTime) -> Vec<u8> {
+    pub fn create_execution_id(&self, phase: &str, timestamp: SystemTime) -> Vec<u8> {
         // TODO: Hash(phase + timestamp + participants)
         // For now, just use phase name
         format!("{}-{:?}", phase, timestamp).into_bytes()

@@ -1,10 +1,13 @@
 mod cli;
+mod crypto;
 mod metrics;
+mod mpc;
 mod network;
 mod rpc;
 mod tracing_config;
 
 use cli::Cli;
+use crypto::run;
 use libp2p::{PeerId, identity};
 use network::Network;
 use rpc::NetworkInfo;
@@ -76,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let current_session_id = Arc::new(RwLock::new(None));
 
     // Initialize P2P network
-    let (p2p_net, network_command_sender) = Network::new(
+    let (p2p_net, network_command_sender, mpc_orchestrator) = Network::new(
         local_peer_id,
         config.network_port,
         local_key,
@@ -99,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         assignment_acceptances: Arc::new(RwLock::new(HashMap::new())),
         sessions,
         current_session_id,
+        mpc_orchestrator,
     };
 
     // Start the RPC server in background
