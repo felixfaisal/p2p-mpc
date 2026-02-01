@@ -3,6 +3,10 @@ name = "p2p-mpc"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+development = []
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 prometheus = "0.13"
@@ -25,3 +29,14 @@ anyhow = "1"
 jsonrpsee = { version = "0.24", features = ["server", "macros", "client"] }
 ratatui = "0.28"
 crossterm = "0.28"
+# CGGMP24 libraries (using published versions from crates.io)
+cggmp24 = { version = "0.7.0-alpha.3", features = ["std", "curve-secp256k1"] }
+cggmp24-keygen = "0.7.0-alpha.3"
+key-share = "0.6.1"
+round-based = "0.4.1"
+futures = "0.3"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "1.0"
+bincode = "1.3"

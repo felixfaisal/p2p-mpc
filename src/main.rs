@@ -1,5 +1,7 @@
 mod cli;
+mod crypto;
 mod metrics;
+mod mpc;
 mod network;
 mod rpc;
 mod tracing_config;
@@ -8,6 +10,7 @@ use cli::Cli;
 use libp2p::{PeerId, identity};
 use network::Network;
 use rpc::NetworkInfo;
+use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -68,18 +71,37 @@ async fn main() -> anyhow::Result<()> {
     let local_peer_id = PeerId::from(local_key.public());
     tracing::info!(target: "GossipNode", "Local peer ID: {}", local_peer_id);
 
+    // Create shared state for RPC and Network
+    let peer_list = Arc::new(RwLock::new(Vec::new()));
+    let listen_addresses = Arc::new(RwLock::new(Vec::new()));
+    let sessions = Arc::new(RwLock::new(HashMap::new()));
+    let current_session_id = Arc::new(RwLock::new(None));
+
     // Initialize P2P network
-    let (p2p_net, network_command_sender) =
-        Network::new(local_peer_id, config.network_port, local_key).await;
+    let (p2p_net, network_command_sender, mpc_orchestrator) = Network::new(
+        local_peer_id,
+        config.network_port,
+        local_key,
+        peer_list.clone(),
+        listen_addresses.clone(),
+        sessions.clone(),
+        current_session_id.clone(),
+    )
+    .await;
 
     // Create shared network info for RPC server
     let network_info = NetworkInfo {
         peer_id: local_peer_id,
-        listen_addresses: Arc::new(RwLock::new(Vec::new())),
-        peers: Arc::new(RwLock::new(Vec::new())),
+        listen_addresses,
+        peers: peer_list,
         topics: Arc::new(RwLock::new(config.topics.clone())),
         protocol_name: network::PROTOCOL_NAME.to_string(),
         network_command_sender: network_command_sender.clone(),
+        peer_assignments: Arc::new(RwLock::new(HashMap::new())),
+        assignment_acceptances: Arc::new(RwLock::new(HashMap::new())),
+        sessions,
+        current_session_id,
+        mpc_orchestrator,
     };
 
     // Start the RPC server in background

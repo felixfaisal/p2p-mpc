@@ -278,6 +278,118 @@ Response:
 
 **Note:** Both nodes must be subscribed to the same topic to receive the broadcast. The sending node will not receive its own message.
 
+#### `network_assignPeerIndices`
+Assign indices to all connected peers for coordinated computation. Each peer receives an assignment and automatically sends back an acceptance.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_assignPeerIndices","params":[],"id":1}' \
+  http://localhost:9944
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "success": true,
+    "session_id": "12D3KooW...-1704672000",
+    "assignments": {
+      "12D3KooWABC...": 0,
+      "12D3KooWXYZ...": 1,
+      "12D3KooWDEF...": 2
+    },
+    "message": "Assignment broadcast to 3 peers"
+  },
+  "id": 1
+}
+```
+
+**How it works:**
+1. Coordinator calls this RPC method
+2. Each connected peer gets assigned a unique index (0, 1, 2, ...)
+3. Assignment broadcast to all peers on `mpc-assignment` topic
+4. Each peer receives assignment and automatically sends acceptance
+5. Coordinator logs all acceptances
+
+**Use case:** Useful for MPC protocols where each peer needs a unique party index for computation coordination.
+
+#### `network_getSessionStatus`
+Query the status of an assignment session to check which peers have accepted their assignments.
+
+```bash
+# Query current/active session
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_getSessionStatus","params":[],"id":1}' \
+  http://localhost:9944
+
+# Query specific session by ID
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"network_getSessionStatus","params":["12D3KooW...-1704672000"],"id":1}' \
+  http://localhost:9944
+```
+
+Parameters:
+- `session_id` (optional string): The session ID to query. If omitted, returns the current/most recent session.
+
+Response (session in progress):
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "success": true,
+    "session_id": "12D3KooWABC...-1704672000",
+    "coordinator_id": "12D3KooWABC...",
+    "assignments": {
+      "12D3KooWABC...": 0,
+      "12D3KooWXYZ...": 1,
+      "12D3KooWDEF...": 2
+    },
+    "acceptances": {
+      "12D3KooWXYZ...": true
+    },
+    "acceptance_count": 1,
+    "total_nodes": 3,
+    "all_accepted": false,
+    "created_at": 1704672000,
+    "message": "Waiting for acceptances: 1/2 received"
+  },
+  "id": 1
+}
+```
+
+Response (all peers accepted):
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "success": true,
+    "session_id": "12D3KooWABC...-1704672000",
+    "coordinator_id": "12D3KooWABC...",
+    "assignments": {
+      "12D3KooWABC...": 0,
+      "12D3KooWXYZ...": 1,
+      "12D3KooWDEF...": 2
+    },
+    "acceptances": {
+      "12D3KooWXYZ...": true,
+      "12D3KooWDEF...": true
+    },
+    "acceptance_count": 2,
+    "total_nodes": 3,
+    "all_accepted": true,
+    "created_at": 1704672000,
+    "message": "All 2 peers have accepted their assignments"
+  },
+  "id": 1
+}
+```
+
+**Notes:**
+- The coordinator (node that called `network_assignPeerIndices`) doesn't send acceptance to itself, so `acceptance_count` will be `total_nodes - 1` when all peers have accepted
+- Use this method to verify all peers are ready before starting MPC computation
+- Sessions are tracked by session ID (format: `<coordinator_peer_id>-<timestamp>`)
+
 ### Custom RPC Port
 
 ```bash
