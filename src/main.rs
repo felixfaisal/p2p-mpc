@@ -7,7 +7,6 @@ mod rpc;
 mod tracing_config;
 
 use cli::Cli;
-use crypto::run;
 use libp2p::{PeerId, identity};
 use network::Network;
 use rpc::NetworkInfo;

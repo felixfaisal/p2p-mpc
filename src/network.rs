@@ -63,19 +63,41 @@ pub enum AssignmentMessage {
     },
 }
 
+/// MPC Aux Protocol Message wrapper for P2P transport
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MpcAuxMessage {
+    /// Sender's peer ID
+    pub from: PeerId,
+    /// Optional recipient party index (None = broadcast to all)
+    pub to: Option<u16>,
+    /// Message type (Broadcast or P2P)
+    pub msg_type: String, // "broadcast" or "p2p"
+    /// Serialized message payload (bincode serialized AuxMsg)
+    pub payload: Vec<u8>,
+}
+
 /// Commands that can be sent to the network worker
-#[derive(Debug)]
 pub enum NetworkCommand {
     /// Broadcast a message to a specific topic
     Broadcast { topic: String, data: Vec<u8> },
     /// Subscribe to a new topic
+    #[allow(unused)]
     Subscribe { topic: String },
     /// Unsubscribe from a topic
+    #[allow(unused)]
     Unsubscribe { topic: String },
     /// Dial a specific peer
+    #[allow(unused)]
     Dial { address: Multiaddr },
+    /// Send MPC aux protocol message (Outgoing from aux party to network)
+    SendAuxMessage(round_based::Outgoing<crate::mpc::AuxMsg>),
+    /// Send MPC keygen protocol message (Outgoing from keygen party to network)
+    SendKeygenMessage(round_based::Outgoing<crate::mpc::ThresholdMessage>),
+    /// Send MPC signing protocol message (Outgoing from signing party to network)
+    SendSigningMessage(round_based::Outgoing<crate::mpc::SigningMessage>),
 }
 
+#[allow(unused)]
 pub struct Networker {
     /// Addresses of our node reachable by other swarm nodes
     pub local_addresses: Arc<Mutex<Vec<Multiaddr>>>,
@@ -137,7 +159,8 @@ pub fn build_gossip(local_key: identity::Keypair) -> std::io::Result<Gossipsub> 
     // Set a custom gossipsub
     let gossipsub_config = gossipsub::GossipsubConfigBuilder::default()
         // This is set to aid debugging by not cluttering the log space
-        .heartbeat_interval(Duration::from_secs(10))
+        .heartbeat_interval(Duration::from_secs(2))
+        .max_transmit_size(65536 * 10000)
         .message_id_fn(message_id_fn)
         .build()
         .expect("Valid config");
@@ -164,7 +187,7 @@ pub fn build_kademlia(peer_id: PeerId) -> Kademlia<MemoryStore> {
 
 ///builds ping behaviour to be use in swarm
 pub fn build_ping() -> ping::Behaviour {
-    let config = ping::Config::new().with_interval(Duration::from_secs(10)); // Ping every 30 seconds to keep connection alive
+    let config = ping::Config::new().with_interval(Duration::from_secs(2)); // Ping every 30 seconds to keep connection alive
     ping::Behaviour::new(config)
 }
 
@@ -214,10 +237,12 @@ pub struct Network {
     pub id: PeerId,
     pub port: u16,
     pub peers: Arc<AtomicUsize>,
+    #[allow(unused)]
     node_keys: Keypair,
     swarm: Arc<Swarm<LocalNetworkBehaviour>>,
     bootstrapped: Arc<AtomicBool>,
     command_receiver: mpsc::UnboundedReceiver<NetworkCommand>,
+    command_sender: mpsc::UnboundedSender<NetworkCommand>,
     // Shared state with RPC
     peer_list: Arc<TokioRwLock<Vec<PeerId>>>,
     listen_addresses: Arc<TokioRwLock<Vec<Multiaddr>>>,
@@ -271,6 +296,7 @@ impl Network {
             swarm,
             bootstrapped: Arc::new(AtomicBool::new(false)),
             command_receiver,
+            command_sender: command_sender.clone(),
             peer_list,
             listen_addresses,
             sessions,
@@ -284,6 +310,7 @@ impl Network {
     /// Returns `true` if number of all swarm's gossip_sub peers greater or equal to target
     /// # Parameters
     /// * target - number of nodes we expect at least in the gossip sub network
+    #[allow(unused)]
     pub fn have_sufficient_peers(&self, target: usize) -> bool {
         self.peers.load(Ordering::Relaxed) >= target
     }
@@ -296,6 +323,7 @@ impl Network {
         sessions: &Arc<TokioRwLock<HashMap<String, crate::rpc::SessionInfo>>>,
         current_session_id: &Arc<TokioRwLock<Option<String>>>,
         mpc_orchestrator: &Arc<TokioRwLock<Option<MPCOrchestrator>>>,
+        network_command_sender: &mpsc::UnboundedSender<NetworkCommand>,
     ) {
         match assignment_msg {
             AssignmentMessage::Request {
@@ -398,6 +426,7 @@ impl Network {
                                         participants.clone(),
                                         party_assignments.clone(),
                                         Duration::from_secs(300),
+                                        network_command_sender.clone(),
                                     );
 
                                     // Store orchestrator
@@ -496,6 +525,7 @@ impl Network {
                             participants.clone(),
                             party_assignments.clone(),
                             Duration::from_secs(300),
+                            network_command_sender.clone(),
                         );
 
                         // Store orchestrator
@@ -542,6 +572,24 @@ impl Network {
             .subscribe(&Sha256Topic::new(MPC_COORDINATION_TOPIC))?;
         tracing::info!(target:"GossipNode","Subscribed to mpc-coordination topic");
 
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&Sha256Topic::new("mpc-aux-protocol"))?;
+        tracing::info!(target:"GossipNode","Subscribed to mpc-aux-protocol topic");
+
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&Sha256Topic::new("mpc-keygen-protocol"))?;
+        tracing::info!(target:"GossipNode","Subscribed to mpc-keygen-protocol topic");
+
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&Sha256Topic::new("mpc-signing-protocol"))?;
+        tracing::info!(target:"GossipNode","Subscribed to mpc-signing-protocol topic");
+
         for topic in topics.as_ref() {
             swarm
                 .behaviour_mut()
@@ -587,7 +635,7 @@ impl Network {
                 tracing::info!("Kademlia bootstrap initiated");
             }
         }
-        loop {
+        'event_loop: loop {
             tokio::select! {
                 // Handle commands from the command channel
                 Some(command) = self.command_receiver.recv() => {
@@ -635,6 +683,195 @@ impl Network {
                                 }
                             }
                         }
+                        NetworkCommand::SendAuxMessage(outgoing_msg) => {
+                            // Serialize the inner message
+                            let payload = match bincode::serialize(&outgoing_msg.msg) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    tracing::error!(
+                                        target:"GossipNode",
+                                        "Failed to serialize aux message payload: {}",
+                                        e
+                                    );
+                                    continue 'event_loop;
+                                }
+                            };
+
+                            // Determine message type and recipient
+                            let (msg_type, to) = match outgoing_msg.recipient {
+                                round_based::MessageDestination::AllParties => {
+                                    ("broadcast".to_string(), None)
+                                }
+                                round_based::MessageDestination::OneParty(party_idx) => {
+                                    ("p2p".to_string(), Some(party_idx))
+                                }
+                            };
+
+                            // Wrap in a structure with sender and optional recipient
+                            let wrapped_msg = MpcAuxMessage {
+                                from: self.id,
+                                to,
+                                msg_type: msg_type.clone(),
+                                payload,
+                            };
+
+                            // Serialize and broadcast via gossipsub
+                            match serde_json::to_string(&wrapped_msg) {
+                                Ok(json) => {
+                                    let topic = Sha256Topic::new("mpc-aux-protocol");
+                                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json.into_bytes()) {
+                                        Ok(_) => {
+                                            tracing::info!(
+                                                target:"GossipNode",
+                                                "📤 Broadcasted aux message (type: {}, to: {:?})",
+                                                msg_type,
+                                                wrapped_msg.to
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                target:"GossipNode",
+                                                "Failed to broadcast aux message: {:?}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        target:"GossipNode",
+                                        "Failed to serialize wrapped aux message: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        NetworkCommand::SendKeygenMessage(outgoing_msg) => {
+                            // Serialize the inner message
+                            let payload = match bincode::serialize(&outgoing_msg.msg) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    tracing::error!(
+                                        target:"GossipNode",
+                                        "Failed to serialize keygen message payload: {}",
+                                        e
+                                    );
+                                    continue 'event_loop;
+                                }
+                            };
+
+                            // Determine message type and recipient
+                            let (msg_type, to) = match outgoing_msg.recipient {
+                                round_based::MessageDestination::AllParties => {
+                                    ("broadcast".to_string(), None)
+                                }
+                                round_based::MessageDestination::OneParty(party_idx) => {
+                                    ("p2p".to_string(), Some(party_idx))
+                                }
+                            };
+
+                            // Wrap in a structure with sender and optional recipient
+                            let wrapped_msg = MpcAuxMessage {
+                                from: self.id,
+                                to,
+                                msg_type: msg_type.clone(),
+                                payload,
+                            };
+
+                            // Serialize and broadcast via gossipsub
+                            match serde_json::to_string(&wrapped_msg) {
+                                Ok(json) => {
+                                    let topic = Sha256Topic::new("mpc-keygen-protocol");
+                                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json.into_bytes()) {
+                                        Ok(_) => {
+                                            tracing::info!(
+                                                target:"GossipNode",
+                                                "📤 Broadcasted keygen message (type: {}, to: {:?})",
+                                                msg_type,
+                                                wrapped_msg.to
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                target:"GossipNode",
+                                                "Failed to broadcast keygen message: {:?}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        target:"GossipNode",
+                                        "Failed to serialize wrapped keygen message: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        NetworkCommand::SendSigningMessage(outgoing_msg) => {
+                            // Serialize the inner message
+                            let payload = match bincode::serialize(&outgoing_msg.msg) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    tracing::error!(
+                                        target:"GossipNode",
+                                        "Failed to serialize signing message payload: {}",
+                                        e
+                                    );
+                                    continue 'event_loop;
+                                }
+                            };
+
+                            // Determine message type and recipient
+                            let (msg_type, to) = match outgoing_msg.recipient {
+                                round_based::MessageDestination::AllParties => {
+                                    ("broadcast".to_string(), None)
+                                }
+                                round_based::MessageDestination::OneParty(party_idx) => {
+                                    ("p2p".to_string(), Some(party_idx))
+                                }
+                            };
+
+                            // Wrap in a structure with sender and optional recipient
+                            let wrapped_msg = MpcAuxMessage {
+                                from: self.id,
+                                to,
+                                msg_type: msg_type.clone(),
+                                payload,
+                            };
+
+                            // Serialize and broadcast via gossipsub
+                            match serde_json::to_string(&wrapped_msg) {
+                                Ok(json) => {
+                                    let topic = Sha256Topic::new("mpc-signing-protocol");
+                                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json.into_bytes()) {
+                                        Ok(_) => {
+                                            tracing::info!(
+                                                target:"GossipNode",
+                                                "📤 Broadcasted signing message (type: {}, to: {:?})",
+                                                msg_type,
+                                                wrapped_msg.to
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                target:"GossipNode",
+                                                "Failed to broadcast signing message: {:?}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        target:"GossipNode",
+                                        "Failed to serialize wrapped signing message: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 event = swarm.select_next_some() => match event {
@@ -658,7 +895,7 @@ impl Network {
                                     if message.topic == assignment_topic.hash() {
                                         match serde_json::from_str::<AssignmentMessage>(&message_str) {
                                             Ok(assignment_msg) => {
-                                                Self::handle_assignment_message(&self.id, assignment_msg, swarm, &self.sessions, &self.current_session_id, &self.mpc_orchestrator).await;
+                                                Self::handle_assignment_message(&self.id, assignment_msg, swarm, &self.sessions, &self.current_session_id, &self.mpc_orchestrator, &self.command_sender).await;
                                             }
                                             Err(e) => {
                                                 tracing::warn!(target:"GossipNode", "Failed to parse assignment message: {}", e);
@@ -699,6 +936,321 @@ impl Network {
                                                 tracing::warn!(target:"GossipNode", "Failed to parse MPC coordination message: {}", e);
                                             }
                                         }
+                                    } else if message.topic == Sha256Topic::new("mpc-aux-protocol").hash() {
+                                        // Handle MPC aux protocol messages
+                                        match serde_json::from_str::<MpcAuxMessage>(&message_str) {
+                                            Ok(aux_msg) => {
+                                                tracing::info!(
+                                                    target:"GossipNode",
+                                                    "📦 Received aux message from {} (type: {}, to: {:?})",
+                                                    aux_msg.from,
+                                                    aux_msg.msg_type,
+                                                    aux_msg.to
+                                                );
+
+                                                // Get orchestrator to access party assignments and aux_incoming_tx
+                                                let orchestrator_lock = self.mpc_orchestrator.read().await;
+                                                if let Some(orchestrator) = orchestrator_lock.as_ref() {
+                                                    // Filter P2P messages by recipient
+                                                    if let Some(target_party_idx) = aux_msg.to {
+                                                        // This is a P2P message - check if it's for us
+                                                        let our_party_idx = orchestrator.party_assignments.get(&self.id);
+
+                                                        if our_party_idx != Some(&target_party_idx) {
+                                                            // Not for us, skip
+                                                            tracing::trace!(
+                                                                target:"GossipNode",
+                                                                "Skipping P2P message not meant for us (target: {}, our_idx: {:?})",
+                                                                target_party_idx,
+                                                                our_party_idx
+                                                            );
+                                                            continue 'event_loop;
+                                                        }
+                                                    }
+
+                                                    // Deserialize inner AuxMsg payload
+                                                    match bincode::deserialize::<crate::mpc::AuxMsg>(&aux_msg.payload) {
+                                                        Ok(inner_msg) => {
+                                                            // Get sender's party index
+                                                            let sender_party_idx = orchestrator.party_assignments.get(&aux_msg.from)
+                                                                .copied();
+
+                                                            if sender_party_idx.is_none() {
+                                                                tracing::warn!(
+                                                                    target:"GossipNode",
+                                                                    "Received aux message from unknown peer: {}",
+                                                                    aux_msg.from
+                                                                );
+                                                                continue 'event_loop;
+                                                            }
+
+                                                            // Create Incoming message
+                                                            let incoming = round_based::Incoming {
+                                                                id: 0, // This is hardcoded for now, TODO: It is used for de-duplication
+                                                                sender: sender_party_idx.unwrap(),
+                                                                msg_type: if aux_msg.msg_type == "broadcast" {
+                                                                    round_based::MessageType::Broadcast
+                                                                } else {
+                                                                    round_based::MessageType::P2P
+                                                                },
+                                                                msg: inner_msg,
+                                                            };
+
+                                                            // Forward to aux_incoming_tx if available
+                                                            if let Some(aux_tx) = &orchestrator.aux_incoming_tx {
+                                                                if let Err(e) = aux_tx.send(incoming) {
+                                                                    tracing::error!(
+                                                                        target:"GossipNode",
+                                                                        "Failed to forward aux message to aux task: {:?}",
+                                                                        e
+                                                                    );
+                                                                } else {
+                                                                    tracing::debug!(
+                                                                        target:"GossipNode",
+                                                                        "✅ Forwarded aux message from party {} to aux task",
+                                                                        sender_party_idx.unwrap()
+                                                                    );
+                                                                }
+                                                            } else {
+                                                                tracing::warn!(
+                                                                    target:"GossipNode",
+                                                                    "Received aux message but aux_incoming_tx not initialized"
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!(
+                                                                target:"GossipNode",
+                                                                "Failed to deserialize aux message payload: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    tracing::warn!(
+                                                        target:"GossipNode",
+                                                        "Received aux message but orchestrator not initialized"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    target:"GossipNode",
+                                                    "Failed to parse MPC aux message: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    } else if message.topic == Sha256Topic::new("mpc-keygen-protocol").hash() {
+                                        // Handle MPC keygen protocol messages
+                                        match serde_json::from_str::<MpcAuxMessage>(&message_str) {
+                                            Ok(keygen_msg) => {
+                                                tracing::info!(
+                                                    target:"GossipNode",
+                                                    "🔑 Received keygen message from {} (type: {}, to: {:?})",
+                                                    keygen_msg.from,
+                                                    keygen_msg.msg_type,
+                                                    keygen_msg.to
+                                                );
+
+                                                // Get orchestrator to access party assignments and keygen_incoming_tx
+                                                let orchestrator_lock = self.mpc_orchestrator.read().await;
+                                                if let Some(orchestrator) = orchestrator_lock.as_ref() {
+                                                    // Filter P2P messages by recipient
+                                                    if let Some(target_party_idx) = keygen_msg.to {
+                                                        // This is a P2P message - check if it's for us
+                                                        let our_party_idx = orchestrator.party_assignments.get(&self.id);
+
+                                                        if our_party_idx != Some(&target_party_idx) {
+                                                            // Not for us, skip
+                                                            tracing::trace!(
+                                                                target:"GossipNode",
+                                                                "Skipping P2P keygen message not meant for us (target: {}, our_idx: {:?})",
+                                                                target_party_idx,
+                                                                our_party_idx
+                                                            );
+                                                            continue 'event_loop;
+                                                        }
+                                                    }
+
+                                                    // Deserialize inner ThresholdMessage payload
+                                                    match bincode::deserialize::<crate::mpc::ThresholdMessage>(&keygen_msg.payload) {
+                                                        Ok(inner_msg) => {
+                                                            // Get sender's party index
+                                                            let sender_party_idx = orchestrator.party_assignments.get(&keygen_msg.from)
+                                                                .copied();
+
+                                                            if sender_party_idx.is_none() {
+                                                                tracing::warn!(
+                                                                    target:"GossipNode",
+                                                                    "Received keygen message from unknown peer: {}",
+                                                                    keygen_msg.from
+                                                                );
+                                                                continue 'event_loop;
+                                                            }
+
+                                                            // Create Incoming message
+                                                            let incoming = round_based::Incoming {
+                                                                id: 0, // This is hardcoded for now, TODO: It is used for de-duplication
+                                                                sender: sender_party_idx.unwrap(),
+                                                                msg_type: if keygen_msg.msg_type == "broadcast" {
+                                                                    round_based::MessageType::Broadcast
+                                                                } else {
+                                                                    round_based::MessageType::P2P
+                                                                },
+                                                                msg: inner_msg,
+                                                            };
+
+                                                            // Forward to keygen_incoming_tx if available
+                                                            if let Some(keygen_tx) = &orchestrator.keygen_incoming_tx {
+                                                                if let Err(e) = keygen_tx.send(incoming) {
+                                                                    tracing::error!(
+                                                                        target:"GossipNode",
+                                                                        "Failed to forward keygen message to keygen task: {:?}",
+                                                                        e
+                                                                    );
+                                                                } else {
+                                                                    tracing::debug!(
+                                                                        target:"GossipNode",
+                                                                        "✅ Forwarded keygen message from party {} to keygen task",
+                                                                        sender_party_idx.unwrap()
+                                                                    );
+                                                                }
+                                                            } else {
+                                                                tracing::warn!(
+                                                                    target:"GossipNode",
+                                                                    "Received keygen message but keygen_incoming_tx not initialized"
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!(
+                                                                target:"GossipNode",
+                                                                "Failed to deserialize keygen message payload: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    tracing::warn!(
+                                                        target:"GossipNode",
+                                                        "Received keygen message but orchestrator not initialized"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    target:"GossipNode",
+                                                    "Failed to parse MPC keygen message: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    } else if message.topic == Sha256Topic::new("mpc-signing-protocol").hash() {
+                                        // Handle MPC signing protocol messages
+                                        match serde_json::from_str::<MpcAuxMessage>(&message_str) {
+                                            Ok(signing_msg) => {
+                                                tracing::info!(
+                                                    target:"GossipNode",
+                                                    "✍️  Received signing message from {} (type: {}, to: {:?})",
+                                                    signing_msg.from,
+                                                    signing_msg.msg_type,
+                                                    signing_msg.to
+                                                );
+
+                                                // Get orchestrator to access party assignments and signing_incoming_tx
+                                                let orchestrator_lock = self.mpc_orchestrator.read().await;
+                                                if let Some(orchestrator) = orchestrator_lock.as_ref() {
+                                                    // Filter P2P messages by recipient
+                                                    if let Some(target_party_idx) = signing_msg.to {
+                                                        // This is a P2P message - check if it's for us
+                                                        let our_party_idx = orchestrator.party_assignments.get(&self.id);
+
+                                                        if our_party_idx != Some(&target_party_idx) {
+                                                            // Not for us, skip
+                                                            tracing::trace!(
+                                                                target:"GossipNode",
+                                                                "Skipping P2P signing message not meant for us (target: {}, our_idx: {:?})",
+                                                                target_party_idx,
+                                                                our_party_idx
+                                                            );
+                                                            continue 'event_loop;
+                                                        }
+                                                    }
+
+                                                    // Deserialize inner SigningMessage payload
+                                                    match bincode::deserialize::<crate::mpc::SigningMessage>(&signing_msg.payload) {
+                                                        Ok(inner_msg) => {
+                                                            // Get sender's party index
+                                                            let sender_party_idx = orchestrator.party_assignments.get(&signing_msg.from)
+                                                                .copied();
+
+                                                            if sender_party_idx.is_none() {
+                                                                tracing::warn!(
+                                                                    target:"GossipNode",
+                                                                    "Received signing message from unknown peer: {}",
+                                                                    signing_msg.from
+                                                                );
+                                                                continue 'event_loop;
+                                                            }
+
+                                                            // Create Incoming message
+                                                            let incoming = round_based::Incoming {
+                                                                id: 0, // This is hardcoded for now, TODO: It is used for de-duplication
+                                                                sender: sender_party_idx.unwrap(),
+                                                                msg_type: if signing_msg.msg_type == "broadcast" {
+                                                                    round_based::MessageType::Broadcast
+                                                                } else {
+                                                                    round_based::MessageType::P2P
+                                                                },
+                                                                msg: inner_msg,
+                                                            };
+
+                                                            // Forward to signing_incoming_tx if available
+                                                            if let Some(signing_tx) = &orchestrator.signing_incoming_tx {
+                                                                if let Err(e) = signing_tx.send(incoming) {
+                                                                    tracing::error!(
+                                                                        target:"GossipNode",
+                                                                        "Failed to forward signing message to signing task: {:?}",
+                                                                        e
+                                                                    );
+                                                                } else {
+                                                                    tracing::debug!(
+                                                                        target:"GossipNode",
+                                                                        "✅ Forwarded signing message from party {} to signing task",
+                                                                        sender_party_idx.unwrap()
+                                                                    );
+                                                                }
+                                                            } else {
+                                                                tracing::warn!(
+                                                                    target:"GossipNode",
+                                                                    "Received signing message but signing_incoming_tx not initialized"
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!(
+                                                                target:"GossipNode",
+                                                                "Failed to deserialize signing message payload: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    tracing::warn!(
+                                                        target:"GossipNode",
+                                                        "Received signing message but orchestrator not initialized"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    target:"GossipNode",
+                                                    "Failed to parse MPC signing message: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
                                     } else {
                                         // Log regular received message
                                         tracing::info!(
@@ -731,7 +1283,7 @@ impl Network {
                             // Filter out our own identify events
                             if peer_id == self.id {
                                 tracing::debug!(target:"GossipNode","Ignoring identify event from ourselves");
-                                continue;
+                                continue 'event_loop;
                             }
 
                             // Add addresses to Kademlia DHT
@@ -845,6 +1397,7 @@ impl Network {
                     },
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                         tracing::info!(target:"GossipNode", "Connection closed with peer {}: {:?}", peer_id, cause);
+
                         // Remove peer from shared list
                         let mut peers = self.peer_list.write().await;
                         peers.retain(|p| p != &peer_id);

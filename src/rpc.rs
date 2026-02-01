@@ -129,6 +129,25 @@ pub struct InitiateAuxGenResponse {
     pub execution_id: Option<String>,
 }
 
+/// Response structure for MPC keygen initiation
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InitiateKeygenResponse {
+    pub success: bool,
+    pub message: String,
+    pub execution_id: Option<String>,
+    pub threshold: Option<u16>,
+    pub total_parties: Option<u16>,
+}
+
+/// Response structure for MPC signing initiation
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InitiateSigningResponse {
+    pub success: bool,
+    pub message: String,
+    pub execution_id: Option<String>,
+    pub signers: Option<Vec<u16>>,
+}
+
 /// RPC API definition
 #[rpc(server)]
 pub trait NetworkRpc {
@@ -170,6 +189,18 @@ pub trait NetworkRpc {
     /// Initiate MPC aux generation phase
     #[method(name = "mpc_initiateAuxGen")]
     async fn initiate_aux_gen(&self) -> RpcResult<InitiateAuxGenResponse>;
+
+    /// Initiate MPC keygen phase
+    #[method(name = "mpc_initiateKeygen")]
+    async fn initiate_keygen(&self, threshold: u16) -> RpcResult<InitiateKeygenResponse>;
+
+    /// Initiate MPC signing phase
+    #[method(name = "mpc_initiateSigning")]
+    async fn initiate_signing(
+        &self,
+        message: String,
+        signers: Vec<u16>,
+    ) -> RpcResult<InitiateSigningResponse>;
 }
 
 /// RPC server implementation
@@ -544,6 +575,293 @@ impl NetworkRpcServer for NetworkRpcImpl {
                 success: false,
                 message: format!("Failed to serialize coordination message: {}", e),
                 execution_id: None,
+            }),
+        }
+    }
+
+    async fn initiate_keygen(&self, threshold: u16) -> RpcResult<InitiateKeygenResponse> {
+        use std::time::SystemTime;
+
+        // Check if orchestrator is initialized
+        let mut orchestrator_lock = self.info.mpc_orchestrator.write().await;
+        let orchestrator = match orchestrator_lock.as_mut() {
+            Some(orch) => orch,
+            None => {
+                return Ok(InitiateKeygenResponse {
+                    success: false,
+                    message: "MPC orchestrator not initialized. Please assign peer indices first."
+                        .to_string(),
+                    execution_id: None,
+                    threshold: None,
+                    total_parties: None,
+                });
+            }
+        };
+
+        // Get total number of parties
+        let total_parties = orchestrator.participants.len() as u16;
+
+        // Validate threshold
+        if threshold == 0 {
+            return Ok(InitiateKeygenResponse {
+                success: false,
+                message: "Threshold must be at least 1".to_string(),
+                execution_id: None,
+                threshold: Some(threshold),
+                total_parties: Some(total_parties),
+            });
+        }
+
+        if threshold > total_parties {
+            return Ok(InitiateKeygenResponse {
+                success: false,
+                message: format!(
+                    "Threshold ({}) cannot exceed total parties ({})",
+                    threshold, total_parties
+                ),
+                execution_id: None,
+                threshold: Some(threshold),
+                total_parties: Some(total_parties),
+            });
+        }
+
+        // Get orchestrator state
+        let state = orchestrator.get_state().await;
+
+        // Verify we're in AuxCompleted state (or allow Idle for testing)
+        match state {
+            crate::mpc::ProtocolState::AuxCompleted { .. } | crate::mpc::ProtocolState::Idle => {
+                // Good to proceed
+            }
+            _ => {
+                return Ok(InitiateKeygenResponse {
+                    success: false,
+                    message: format!(
+                        "Cannot initiate keygen. Must complete aux generation first. Current state: {:?}",
+                        state
+                    ),
+                    execution_id: None,
+                    threshold: Some(threshold),
+                    total_parties: Some(total_parties),
+                });
+            }
+        }
+
+        // Create execution ID
+        let timestamp = SystemTime::now();
+        let execution_id = orchestrator.create_execution_id("keygen", timestamp);
+        let execution_id_hex = hex::encode(&execution_id);
+
+        // Create InitiateKeygen coordination message
+        let coord_message = crate::mpc::CoordinationMessage::InitiateKeygen {
+            execution_id: execution_id.clone(),
+            threshold,
+            total_parties,
+            timestamp,
+        };
+
+        // Serialize and broadcast via P2P
+        match serde_json::to_string(&coord_message) {
+            Ok(json) => {
+                let data = json.into_bytes();
+                match self.info.network_command_sender.send(
+                    crate::network::NetworkCommand::Broadcast {
+                        topic: crate::network::MPC_COORDINATION_TOPIC.to_string(),
+                        data,
+                    },
+                ) {
+                    Ok(_) => {
+                        tracing::info!(
+                            "📡 Broadcasted InitiateKeygen message (execution_id: {}, t={}, n={})",
+                            execution_id_hex,
+                            threshold,
+                            total_parties
+                        );
+
+                        // Handle the message locally as well (self-message)
+                        if let Err(e) = orchestrator
+                            .handle_coordination_message(self.info.peer_id, coord_message)
+                            .await
+                        {
+                            tracing::error!("Failed to handle local keygen initiation: {:?}", e);
+                            return Ok(InitiateKeygenResponse {
+                                success: false,
+                                message: format!("Failed to process locally: {}", e),
+                                execution_id: Some(execution_id_hex),
+                                threshold: Some(threshold),
+                                total_parties: Some(total_parties),
+                            });
+                        }
+
+                        Ok(InitiateKeygenResponse {
+                            success: true,
+                            message: format!(
+                                "Keygen initiated with {} participants (threshold: {})",
+                                total_parties, threshold
+                            ),
+                            execution_id: Some(execution_id_hex),
+                            threshold: Some(threshold),
+                            total_parties: Some(total_parties),
+                        })
+                    }
+                    Err(e) => Ok(InitiateKeygenResponse {
+                        success: false,
+                        message: format!("Failed to broadcast message: {}", e),
+                        execution_id: Some(execution_id_hex),
+                        threshold: Some(threshold),
+                        total_parties: Some(total_parties),
+                    }),
+                }
+            }
+            Err(e) => Ok(InitiateKeygenResponse {
+                success: false,
+                message: format!("Failed to serialize coordination message: {}", e),
+                execution_id: None,
+                threshold: Some(threshold),
+                total_parties: Some(total_parties),
+            }),
+        }
+    }
+
+    async fn initiate_signing(
+        &self,
+        message: String,
+        signers: Vec<u16>,
+    ) -> RpcResult<InitiateSigningResponse> {
+        use std::time::SystemTime;
+
+        // Check if orchestrator is initialized
+        let mut orchestrator_lock = self.info.mpc_orchestrator.write().await;
+        let orchestrator = match orchestrator_lock.as_mut() {
+            Some(orch) => orch,
+            None => {
+                return Ok(InitiateSigningResponse {
+                    success: false,
+                    message: "MPC orchestrator not initialized. Please assign peer indices first."
+                        .to_string(),
+                    execution_id: None,
+                    signers: None,
+                });
+            }
+        };
+
+        // Validate signers list
+        if signers.is_empty() {
+            return Ok(InitiateSigningResponse {
+                success: false,
+                message: "Signers list cannot be empty".to_string(),
+                execution_id: None,
+                signers: Some(signers),
+            });
+        }
+
+        let total_parties = orchestrator.participants.len() as u16;
+
+        // Validate all signers are valid party indices
+        for &signer in &signers {
+            if signer >= total_parties {
+                return Ok(InitiateSigningResponse {
+                    success: false,
+                    message: format!(
+                        "Invalid signer index: {} (total parties: {})",
+                        signer, total_parties
+                    ),
+                    execution_id: None,
+                    signers: Some(signers),
+                });
+            }
+        }
+
+        // Get orchestrator state
+        let state = orchestrator.get_state().await;
+
+        // Verify we're in KeygenCompleted state (or allow Idle for testing)
+        match state {
+            crate::mpc::ProtocolState::KeygenCompleted { .. } | crate::mpc::ProtocolState::Idle => {
+                // Good to proceed
+            }
+            _ => {
+                return Ok(InitiateSigningResponse {
+                    success: false,
+                    message: format!(
+                        "Cannot initiate signing. Must complete keygen first. Current state: {:?}",
+                        state
+                    ),
+                    execution_id: None,
+                    signers: Some(signers),
+                });
+            }
+        }
+
+        // Create execution ID
+        let timestamp = SystemTime::now();
+        let execution_id = orchestrator.create_execution_id("signing", timestamp);
+        let execution_id_hex = hex::encode(&execution_id);
+
+        // Create InitiateSigning coordination message
+        let coord_message = crate::mpc::CoordinationMessage::InitiateSigning {
+            execution_id: execution_id.clone(),
+            message: message.clone().into_bytes(),
+            signers: signers.clone(),
+            timestamp,
+        };
+
+        // Serialize and broadcast via P2P
+        match serde_json::to_string(&coord_message) {
+            Ok(json) => {
+                let data = json.into_bytes();
+                match self.info.network_command_sender.send(
+                    crate::network::NetworkCommand::Broadcast {
+                        topic: crate::network::MPC_COORDINATION_TOPIC.to_string(),
+                        data,
+                    },
+                ) {
+                    Ok(_) => {
+                        tracing::info!(
+                            "📡 Broadcasted InitiateSigning message (execution_id: {}, signers: {:?}, message: {})",
+                            execution_id_hex,
+                            signers,
+                            message
+                        );
+
+                        // Handle the message locally as well (self-message)
+                        if let Err(e) = orchestrator
+                            .handle_coordination_message(self.info.peer_id, coord_message)
+                            .await
+                        {
+                            tracing::error!("Failed to handle local signing initiation: {:?}", e);
+                            return Ok(InitiateSigningResponse {
+                                success: false,
+                                message: format!("Failed to process locally: {}", e),
+                                execution_id: Some(execution_id_hex),
+                                signers: Some(signers),
+                            });
+                        }
+
+                        Ok(InitiateSigningResponse {
+                            success: true,
+                            message: format!(
+                                "Signing initiated with {} signers for message: {}",
+                                signers.len(),
+                                message
+                            ),
+                            execution_id: Some(execution_id_hex),
+                            signers: Some(signers),
+                        })
+                    }
+                    Err(e) => Ok(InitiateSigningResponse {
+                        success: false,
+                        message: format!("Failed to broadcast message: {}", e),
+                        execution_id: Some(execution_id_hex),
+                        signers: Some(signers),
+                    }),
+                }
+            }
+            Err(e) => Ok(InitiateSigningResponse {
+                success: false,
+                message: format!("Failed to serialize coordination message: {}", e),
+                execution_id: None,
+                signers: Some(signers),
             }),
         }
     }
