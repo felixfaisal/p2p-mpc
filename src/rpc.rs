@@ -216,6 +216,7 @@ impl NetworkRpcImpl {
 
 #[async_trait]
 impl NetworkRpcServer for NetworkRpcImpl {
+    #[tracing::instrument(skip(self), fields(peer_id = %self.info.peer_id))]
     async fn get_peer_list(&self) -> RpcResult<PeerListResponse> {
         let peers = self.info.peers.read().await;
         let peer_strings: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
@@ -227,6 +228,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
         })
     }
 
+    #[tracing::instrument(skip(self), fields(peer_id = %self.info.peer_id))]
     async fn get_topic_list(&self) -> RpcResult<TopicListResponse> {
         let topics = self.info.topics.read().await;
         let topic_list = topics.clone();
@@ -238,14 +240,17 @@ impl NetworkRpcServer for NetworkRpcImpl {
         })
     }
 
+    #[tracing::instrument(skip(self), fields(peer_id = %self.info.peer_id))]
     fn get_protocol_name(&self) -> RpcResult<String> {
         Ok(self.info.protocol_name.clone())
     }
 
+    #[tracing::instrument(skip(self), fields(peer_id = %self.info.peer_id))]
     fn get_peer_id(&self) -> RpcResult<String> {
         Ok(self.info.peer_id.to_string())
     }
 
+    #[tracing::instrument(skip(self), fields(peer_id = %self.info.peer_id))]
     async fn get_multiaddresses(&self) -> RpcResult<MultiaddressResponse> {
         let addrs = self.info.listen_addresses.read().await;
         let addr_strings: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
@@ -257,6 +262,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
         })
     }
 
+    #[tracing::instrument(skip(self, message), fields(peer_id = %self.info.peer_id, topic = %topic, message_len = message.len()))]
     async fn broadcast(&self, topic: String, message: String) -> RpcResult<BroadcastResponse> {
         let data = message.into_bytes();
 
@@ -284,6 +290,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(peer_id = %self.info.peer_id))]
     async fn assign_peer_indices(&self) -> RpcResult<AssignmentResponse> {
         // Get list of connected peers
         let peers = self.info.peers.read().await;
@@ -399,6 +406,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(peer_id = %self.info.peer_id, session_id = ?session_id))]
     async fn get_session_status(
         &self,
         session_id: Option<String>,
@@ -475,6 +483,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(peer_id = %self.info.peer_id))]
     async fn initiate_aux_gen(&self) -> RpcResult<InitiateAuxGenResponse> {
         use std::time::SystemTime;
 
@@ -579,6 +588,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(peer_id = %self.info.peer_id, threshold))]
     async fn initiate_keygen(&self, threshold: u16) -> RpcResult<InitiateKeygenResponse> {
         use std::time::SystemTime;
 
@@ -723,6 +733,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
         }
     }
 
+    #[tracing::instrument(skip(self, message), fields(peer_id = %self.info.peer_id, message_len = message.len(), signers = ?signers))]
     async fn initiate_signing(
         &self,
         message: String,
@@ -868,6 +879,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
 }
 
 /// Start the JSON-RPC server
+#[tracing::instrument(skip(network_info), fields(port, peer_id = %network_info.peer_id))]
 pub async fn start_rpc_server(port: u16, network_info: NetworkInfo) -> anyhow::Result<()> {
     let server = Server::builder().build(format!("0.0.0.0:{}", port)).await?;
 

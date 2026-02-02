@@ -255,6 +255,7 @@ pub struct Network {
 }
 
 impl Network {
+    #[tracing::instrument(skip(node_keys, peer_list, listen_addresses, sessions, current_session_id), fields(peer_id = %id, port))]
     pub async fn new(
         id: PeerId,
         port: u16,
@@ -317,6 +318,7 @@ impl Network {
     }
 
     /// Handle assignment messages (both requests and acceptances)
+    #[tracing::instrument(skip(swarm, sessions, current_session_id, mpc_orchestrator, network_command_sender), fields(local_peer = %local_peer_id))]
     async fn handle_assignment_message(
         local_peer_id: &PeerId,
         assignment_msg: AssignmentMessage,
@@ -550,6 +552,7 @@ impl Network {
         }
     }
 
+    #[tracing::instrument(skip(self, topics, seed_nodes, boot_nodes), fields(peer_id = %self.id))]
     pub async fn run(
         mut self,
         topics: impl AsRef<[String]>,

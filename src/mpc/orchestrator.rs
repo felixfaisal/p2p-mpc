@@ -349,6 +349,7 @@ impl MPCOrchestrator {
     // ========================================================================
 
     /// Handle incoming coordination message from another peer
+    #[tracing::instrument(skip(self, message), fields(from_peer = %from, message_type = ?message))]
     pub async fn handle_coordination_message(
         &mut self,
         from: PeerId,
@@ -382,6 +383,7 @@ impl MPCOrchestrator {
     }
 
     /// Handle InitiateAux message
+    #[tracing::instrument(skip(self, message), fields(from_peer = %from))]
     async fn handle_initiate_aux(
         &mut self,
         from: PeerId,
@@ -538,6 +540,7 @@ impl MPCOrchestrator {
     }
 
     /// Handle InitiateKeygen message
+    #[tracing::instrument(skip(self, message), fields(from_peer = %from))]
     async fn handle_initiate_keygen(
         &mut self,
         from: PeerId,
@@ -717,6 +720,7 @@ impl MPCOrchestrator {
     }
 
     /// Handle InitiateSigning message
+    #[tracing::instrument(skip(self, message), fields(from_peer = %from))]
     async fn handle_initiate_signing(
         &mut self,
         from: PeerId,

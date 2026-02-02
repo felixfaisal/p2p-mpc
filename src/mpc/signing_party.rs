@@ -96,6 +96,7 @@ impl SigningParty {
     }
 
     /// Sign a message using threshold signature scheme
+    #[tracing::instrument(skip(self, message, outgoing_tx), fields(party_id = %self.id, signers = ?signers, timestamp, message_len = message.len()))]
     pub async fn sign_message(
         &mut self,
         signers: &[u16],

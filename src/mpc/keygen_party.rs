@@ -91,6 +91,7 @@ impl KeygenParty {
     }
 
     /// Generate key share for threshold signature scheme
+    #[tracing::instrument(skip(self, outgoing_tx), fields(party_id = %self.id, n, threshold = t, timestamp))]
     pub async fn generate_key_share(
         &mut self,
         n: u16,

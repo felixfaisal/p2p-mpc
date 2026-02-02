@@ -14,6 +14,9 @@ use tokio::sync::mpsc;
 use crate::mpc::{AuxMsg, PartyId, SecurityLevelTest};
 use crate::network::NetworkCommand;
 
+#[cfg(feature = "development")]
+use crate::metrics;
+
 /// AuxParty represents a single party in the aux generation protocol
 pub struct AuxParty {
     id: PartyId,
@@ -143,6 +146,7 @@ impl AuxParty {
     }
 
     /// Generate aux info for threshold signature scheme
+    #[tracing::instrument(skip(self, outgoing_tx), fields(party_id = %self.id, n, timestamp))]
     pub async fn generate_aux_info(
         &mut self,
         n: u16,
