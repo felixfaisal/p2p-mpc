@@ -12,6 +12,7 @@ use cggmp24::security_level::SecurityLevel128;
 use cggmp24::supported_curves::Secp256k1;
 use round_based::Incoming;
 
+use crate::metrics;
 use crate::mpc::AuxParty;
 use crate::mpc::{AuxMsg, SecurityLevelTest};
 
@@ -256,6 +257,81 @@ impl MPCOrchestrator {
         self.state.read().await.clone()
     }
 
+    /// Update protocol state metrics
+    fn update_state_metrics(state: &ProtocolState) {
+        // Reset all state gauges
+        metrics::MPC_PROTOCOL_STATE
+            .with_label_values(&["idle"])
+            .set(0.0);
+        metrics::MPC_PROTOCOL_STATE
+            .with_label_values(&["aux_generation"])
+            .set(0.0);
+        metrics::MPC_PROTOCOL_STATE
+            .with_label_values(&["aux_completed"])
+            .set(0.0);
+        metrics::MPC_PROTOCOL_STATE
+            .with_label_values(&["keygen"])
+            .set(0.0);
+        metrics::MPC_PROTOCOL_STATE
+            .with_label_values(&["keygen_completed"])
+            .set(0.0);
+        metrics::MPC_PROTOCOL_STATE
+            .with_label_values(&["signing"])
+            .set(0.0);
+        metrics::MPC_PROTOCOL_STATE
+            .with_label_values(&["signing_completed"])
+            .set(0.0);
+        metrics::MPC_PROTOCOL_STATE
+            .with_label_values(&["failed"])
+            .set(0.0);
+
+        // Set current state to 1
+        match state {
+            ProtocolState::Idle => {
+                metrics::MPC_PROTOCOL_STATE
+                    .with_label_values(&["idle"])
+                    .set(1.0);
+            }
+            ProtocolState::AuxGeneration { .. } => {
+                metrics::MPC_PROTOCOL_STATE
+                    .with_label_values(&["aux_generation"])
+                    .set(1.0);
+            }
+            ProtocolState::AuxCompleted { .. } => {
+                metrics::MPC_PROTOCOL_STATE
+                    .with_label_values(&["aux_completed"])
+                    .set(1.0);
+            }
+            ProtocolState::Keygen { threshold, .. } => {
+                metrics::MPC_PROTOCOL_STATE
+                    .with_label_values(&["keygen"])
+                    .set(1.0);
+                metrics::THRESHOLD_VALUE.set(*threshold as f64);
+            }
+            ProtocolState::KeygenCompleted { .. } => {
+                metrics::MPC_PROTOCOL_STATE
+                    .with_label_values(&["keygen_completed"])
+                    .set(1.0);
+            }
+            ProtocolState::Signing { signers, .. } => {
+                metrics::MPC_PROTOCOL_STATE
+                    .with_label_values(&["signing"])
+                    .set(1.0);
+                metrics::ACTIVE_PARTIES.set(signers.len() as f64);
+            }
+            ProtocolState::SigningCompleted { .. } => {
+                metrics::MPC_PROTOCOL_STATE
+                    .with_label_values(&["signing_completed"])
+                    .set(1.0);
+            }
+            ProtocolState::Failed { .. } => {
+                metrics::MPC_PROTOCOL_STATE
+                    .with_label_values(&["failed"])
+                    .set(1.0);
+            }
+        }
+    }
+
     /// Get local peer ID
     #[allow(unused)]
     pub fn local_peer_id(&self) -> PeerId {
@@ -367,12 +443,18 @@ impl MPCOrchestrator {
         );
 
         // Step 4: Update state to AuxGeneration
+        let start_time = Instant::now();
         *state = ProtocolState::AuxGeneration {
             initiator: from,
-            started_at: Instant::now(),
+            started_at: start_time,
             execution_id: execution_id.clone(),
             completed_parties: HashSet::new(),
         };
+
+        // Update metrics
+        Self::update_state_metrics(&*state);
+        metrics::AUX_GENERATION_INITIATED.inc();
+        metrics::ACTIVE_PARTIES.set(self.participants.len() as f64);
 
         tracing::info!(
             "🚀 Transitioned to AuxGeneration state (initiator: {}, our_index: {})",
@@ -391,22 +473,43 @@ impl MPCOrchestrator {
         let protocol_state = self.state.clone();
 
         tokio::task::spawn(async move {
-            let aux_info = party
+            let aux_result = party
                 .generate_aux_info(n, timestamp_secs, outgoing_sender)
-                .await
-                .unwrap();
-            tracing::info!("Aux info generation completed");
+                .await;
 
-            // Store aux info using write lock
-            let mut aux_info_store = aux_info_store.write().await;
-            *aux_info_store = Some(aux_info);
+            match aux_result {
+                Ok(aux_info) => {
+                    let duration = start_time.elapsed().as_secs_f64();
+                    tracing::info!("Aux info generation completed in {:.2}s", duration);
 
-            // Update state to Aux info completed
-            let mut state = protocol_state.write().await;
-            // TODO: Use correct counter
-            *state = ProtocolState::AuxCompleted {
-                completed_at: Instant::now(),
-                success_count: 1,
+                    // Track success metrics
+                    metrics::AUX_GENERATION_COMPLETED.inc();
+                    metrics::AUX_GENERATION_DURATION.observe(duration);
+
+                    // Store aux info using write lock
+                    let mut aux_info_store = aux_info_store.write().await;
+                    *aux_info_store = Some(aux_info);
+
+                    // Update state to Aux info completed
+                    let mut state = protocol_state.write().await;
+                    *state = ProtocolState::AuxCompleted {
+                        completed_at: Instant::now(),
+                        success_count: 1,
+                    };
+                    Self::update_state_metrics(&*state);
+                }
+                Err(e) => {
+                    tracing::error!("Aux info generation failed: {:?}", e);
+                    metrics::AUX_GENERATION_FAILED.inc();
+
+                    let mut state = protocol_state.write().await;
+                    *state = ProtocolState::Failed {
+                        phase: "aux_generation".to_string(),
+                        reason: format!("{:?}", e),
+                        failed_at: Instant::now(),
+                    };
+                    Self::update_state_metrics(&*state);
+                }
             }
         });
 
@@ -514,13 +617,20 @@ impl MPCOrchestrator {
         );
 
         // Step 5: Update state to Keygen
+        let start_time = Instant::now();
         *state = ProtocolState::Keygen {
             initiator: from,
-            started_at: Instant::now(),
+            started_at: start_time,
             execution_id: execution_id.clone(),
             threshold,
             completed_parties: std::collections::HashSet::new(),
         };
+
+        // Update metrics
+        Self::update_state_metrics(&*state);
+        metrics::KEYGEN_INITIATED.inc();
+        metrics::ACTIVE_PARTIES.set(total_parties as f64);
+        metrics::THRESHOLD_VALUE.set(threshold as f64);
 
         tracing::info!(
             "🚀 Transitioned to Keygen state (initiator: {}, threshold: {}/{}, our_index: {})",
@@ -551,21 +661,39 @@ impl MPCOrchestrator {
                 .await
             {
                 Ok(key_share) => {
+                    let duration = start_time.elapsed().as_secs_f64();
                     tracing::info!(
-                        "Shared public key: {}",
+                        "Keygen completed in {:.2}s. Shared public key: {}",
+                        duration,
                         hex::encode(key_share.shared_public_key.to_bytes(true))
                     );
 
-                    *protocol_state.write().await = ProtocolState::KeygenCompleted {
+                    // Track success metrics
+                    metrics::KEYGEN_COMPLETED.inc();
+                    metrics::KEYGEN_DURATION.observe(duration);
+
+                    let mut state = protocol_state.write().await;
+                    *state = ProtocolState::KeygenCompleted {
                         completed_at: Instant::now(),
                         public_key: hex::encode(key_share.shared_public_key.to_bytes(true)),
                     };
+                    Self::update_state_metrics(&*state);
+                    drop(state);
+
                     *key_share_store.write().await = Some(key_share);
                     // TODO: Broadcast KeygenCompleted message
                 }
                 Err(e) => {
                     tracing::error!("Keygen failed: {:?}", e);
-                    // TODO: Update protocol state to Failed
+                    metrics::KEYGEN_FAILED.inc();
+
+                    let mut state = protocol_state.write().await;
+                    *state = ProtocolState::Failed {
+                        phase: "keygen".to_string(),
+                        reason: format!("{:?}", e),
+                        failed_at: Instant::now(),
+                    };
+                    Self::update_state_metrics(&*state);
                     // TODO: Broadcast ProtocolFailed message
                 }
             }
@@ -656,14 +784,20 @@ impl MPCOrchestrator {
         );
 
         // Step 4: Update state to Signing
+        let start_time = Instant::now();
         *state = ProtocolState::Signing {
             initiator: from,
-            started_at: Instant::now(),
+            started_at: start_time,
             execution_id: execution_id.clone(),
             message: message_to_sign.clone(),
             signers: signers.iter().copied().collect(),
             completed_parties: std::collections::HashSet::new(),
         };
+
+        // Update metrics
+        Self::update_state_metrics(&*state);
+        metrics::SIGNING_INITIATED.inc();
+        metrics::ACTIVE_PARTIES.set(signers.len() as f64);
 
         tracing::info!(
             "🚀 Transitioned to Signing state (initiator: {}, signers: {:?})",
@@ -698,7 +832,7 @@ impl MPCOrchestrator {
             let outgoing_sender = self.network_command_tx.clone();
             let protocol_state = self.state.clone();
 
-            // Spawn keygen task
+            // Spawn signing task
             tokio::spawn(async move {
                 match party
                     .sign_message(
@@ -710,17 +844,32 @@ impl MPCOrchestrator {
                     .await
                 {
                     Ok(signature) => {
-                        tracing::info!("Signature Completed: {:?}", signature);
+                        let duration = start_time.elapsed().as_secs_f64();
+                        tracing::info!("Signing completed in {:.2}s: {:?}", duration, signature);
 
-                        *protocol_state.write().await = ProtocolState::SigningCompleted {
+                        // Track success metrics
+                        metrics::SIGNING_COMPLETED.inc();
+                        metrics::SIGNING_DURATION.observe(duration);
+
+                        let mut state = protocol_state.write().await;
+                        *state = ProtocolState::SigningCompleted {
                             completed_at: Instant::now(),
                             signature: format!("{:?}", signature),
-                        }
-                        // TODO: Broadcast KeygenCompleted message
+                        };
+                        Self::update_state_metrics(&*state);
+                        // TODO: Broadcast SigningCompleted message
                     }
                     Err(e) => {
-                        tracing::error!("Keygen failed: {:?}", e);
-                        // TODO: Update protocol state to Failed
+                        tracing::error!("Signing failed: {:?}", e);
+                        metrics::SIGNING_FAILED.inc();
+
+                        let mut state = protocol_state.write().await;
+                        *state = ProtocolState::Failed {
+                            phase: "signing".to_string(),
+                            reason: format!("{:?}", e),
+                            failed_at: Instant::now(),
+                        };
+                        Self::update_state_metrics(&*state);
                         // TODO: Broadcast ProtocolFailed message
                     }
                 }
