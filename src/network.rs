@@ -35,6 +35,7 @@ use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
 
+use crate::metrics;
 use crate::mpc::{CoordinationMessage, MPCOrchestrator};
 
 pub const PROTOCOL_NAME: &str = "/felix/mpc/0.0.0";
@@ -641,10 +642,16 @@ impl Network {
                 Some(command) = self.command_receiver.recv() => {
                     match command {
                         NetworkCommand::Broadcast { topic, data } => {
+                            let data_len = data.len();
+                            let topic_str = topic.clone();
                             let topic = Sha256Topic::new(topic);
                             match swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
                                 Ok(message_id) => {
                                     tracing::info!(target:"GossipNode", "Published message {:?} to topic: {}", message_id, topic);
+
+                                    // Track sent message metrics
+                                    metrics::GOSSIPSUB_MESSAGES_SENT.with_label_values(&[&topic_str]).inc();
+                                    metrics::NETWORK_BYTES_SENT.inc_by(data_len as f64);
                                 }
                                 Err(e) => {
                                     tracing::error!(target:"GossipNode", "Failed to publish message to topic {}: {:?}", topic, e);
@@ -674,12 +681,14 @@ impl Network {
                             }
                         }
                         NetworkCommand::Dial { address } => {
+                            metrics::PEER_DIAL_ATTEMPTS.inc();
                             match swarm.dial(address.clone()) {
                                 Ok(_) => {
                                     tracing::info!(target:"GossipNode", "Dialing peer at: {}", address);
                                 }
                                 Err(e) => {
                                     tracing::error!(target:"GossipNode", "Failed to dial {}: {:?}", address, e);
+                                    metrics::PEER_DIAL_FAILURES.inc();
                                 }
                             }
                         }
@@ -718,8 +727,10 @@ impl Network {
                             // Serialize and broadcast via gossipsub
                             match serde_json::to_string(&wrapped_msg) {
                                 Ok(json) => {
+                                    let data = json.into_bytes();
+                                    let data_len = data.len();
                                     let topic = Sha256Topic::new("mpc-aux-protocol");
-                                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json.into_bytes()) {
+                                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
                                         Ok(_) => {
                                             tracing::info!(
                                                 target:"GossipNode",
@@ -727,6 +738,15 @@ impl Network {
                                                 msg_type,
                                                 wrapped_msg.to
                                             );
+
+                                            // Track MPC message metrics
+                                            metrics::MPC_MESSAGES_SENT.with_label_values(&["aux"]).inc();
+                                            metrics::NETWORK_BYTES_SENT.inc_by(data_len as f64);
+                                            if msg_type == "broadcast" {
+                                                metrics::MPC_BROADCAST_MESSAGES.with_label_values(&["aux"]).inc();
+                                            } else {
+                                                metrics::MPC_P2P_MESSAGES.with_label_values(&["aux"]).inc();
+                                            }
                                         }
                                         Err(e) => {
                                             tracing::error!(
@@ -781,8 +801,10 @@ impl Network {
                             // Serialize and broadcast via gossipsub
                             match serde_json::to_string(&wrapped_msg) {
                                 Ok(json) => {
+                                    let data = json.into_bytes();
+                                    let data_len = data.len();
                                     let topic = Sha256Topic::new("mpc-keygen-protocol");
-                                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json.into_bytes()) {
+                                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
                                         Ok(_) => {
                                             tracing::info!(
                                                 target:"GossipNode",
@@ -790,6 +812,15 @@ impl Network {
                                                 msg_type,
                                                 wrapped_msg.to
                                             );
+
+                                            // Track MPC message metrics
+                                            metrics::MPC_MESSAGES_SENT.with_label_values(&["keygen"]).inc();
+                                            metrics::NETWORK_BYTES_SENT.inc_by(data_len as f64);
+                                            if msg_type == "broadcast" {
+                                                metrics::MPC_BROADCAST_MESSAGES.with_label_values(&["keygen"]).inc();
+                                            } else {
+                                                metrics::MPC_P2P_MESSAGES.with_label_values(&["keygen"]).inc();
+                                            }
                                         }
                                         Err(e) => {
                                             tracing::error!(
@@ -844,8 +875,10 @@ impl Network {
                             // Serialize and broadcast via gossipsub
                             match serde_json::to_string(&wrapped_msg) {
                                 Ok(json) => {
+                                    let data = json.into_bytes();
+                                    let data_len = data.len();
                                     let topic = Sha256Topic::new("mpc-signing-protocol");
-                                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json.into_bytes()) {
+                                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
                                         Ok(_) => {
                                             tracing::info!(
                                                 target:"GossipNode",
@@ -853,6 +886,15 @@ impl Network {
                                                 msg_type,
                                                 wrapped_msg.to
                                             );
+
+                                            // Track MPC message metrics
+                                            metrics::MPC_MESSAGES_SENT.with_label_values(&["signing"]).inc();
+                                            metrics::NETWORK_BYTES_SENT.inc_by(data_len as f64);
+                                            if msg_type == "broadcast" {
+                                                metrics::MPC_BROADCAST_MESSAGES.with_label_values(&["signing"]).inc();
+                                            } else {
+                                                metrics::MPC_P2P_MESSAGES.with_label_values(&["signing"]).inc();
+                                            }
                                         }
                                         Err(e) => {
                                             tracing::error!(
@@ -886,6 +928,11 @@ impl Network {
                                 if message.source.as_ref() == Some(&self.id) {
                                     tracing::debug!(target:"GossipNode", "Ignoring our own message: {:?}", message_id);
                                 } else {
+                                    // Track received message metrics
+                                    let topic_str = message.topic.to_string();
+                                    metrics::GOSSIPSUB_MESSAGES_RECEIVED.with_label_values(&[&topic_str]).inc();
+                                    metrics::NETWORK_BYTES_RECEIVED.inc_by(message.data.len() as f64);
+
                                     let message_str = String::from_utf8_lossy(&message.data);
 
                                     // Check if this is an assignment message
@@ -940,6 +987,14 @@ impl Network {
                                         // Handle MPC aux protocol messages
                                         match serde_json::from_str::<MpcAuxMessage>(&message_str) {
                                             Ok(aux_msg) => {
+                                                // Track MPC message metrics
+                                                metrics::MPC_MESSAGES_RECEIVED.with_label_values(&["aux"]).inc();
+                                                if aux_msg.msg_type == "broadcast" {
+                                                    metrics::MPC_BROADCAST_MESSAGES.with_label_values(&["aux"]).inc();
+                                                } else {
+                                                    metrics::MPC_P2P_MESSAGES.with_label_values(&["aux"]).inc();
+                                                }
+
                                                 tracing::info!(
                                                     target:"GossipNode",
                                                     "📦 Received aux message from {} (type: {}, to: {:?})",
@@ -1045,6 +1100,14 @@ impl Network {
                                         // Handle MPC keygen protocol messages
                                         match serde_json::from_str::<MpcAuxMessage>(&message_str) {
                                             Ok(keygen_msg) => {
+                                                // Track MPC message metrics
+                                                metrics::MPC_MESSAGES_RECEIVED.with_label_values(&["keygen"]).inc();
+                                                if keygen_msg.msg_type == "broadcast" {
+                                                    metrics::MPC_BROADCAST_MESSAGES.with_label_values(&["keygen"]).inc();
+                                                } else {
+                                                    metrics::MPC_P2P_MESSAGES.with_label_values(&["keygen"]).inc();
+                                                }
+
                                                 tracing::info!(
                                                     target:"GossipNode",
                                                     "🔑 Received keygen message from {} (type: {}, to: {:?})",
@@ -1150,6 +1213,14 @@ impl Network {
                                         // Handle MPC signing protocol messages
                                         match serde_json::from_str::<MpcAuxMessage>(&message_str) {
                                             Ok(signing_msg) => {
+                                                // Track MPC message metrics
+                                                metrics::MPC_MESSAGES_RECEIVED.with_label_values(&["signing"]).inc();
+                                                if signing_msg.msg_type == "broadcast" {
+                                                    metrics::MPC_BROADCAST_MESSAGES.with_label_values(&["signing"]).inc();
+                                                } else {
+                                                    metrics::MPC_P2P_MESSAGES.with_label_values(&["signing"]).inc();
+                                                }
+
                                                 tracing::info!(
                                                     target:"GossipNode",
                                                     "✍️  Received signing message from {} (type: {}, to: {:?})",
@@ -1394,6 +1465,10 @@ impl Network {
                     },
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         tracing::info!(target:"GossipNode", "Connection established with peer: {}", peer_id);
+
+                        // Update peer count metric
+                        let peer_count = self.peers.load(Ordering::Relaxed);
+                        metrics::CONNECTED_PEERS.set(peer_count as f64);
                     },
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                         tracing::info!(target:"GossipNode", "Connection closed with peer {}: {:?}", peer_id, cause);
@@ -1404,6 +1479,9 @@ impl Network {
                         let count = self.peers.load(Ordering::Relaxed).saturating_sub(1);
                         self.peers.store(count, Ordering::Relaxed);
                         tracing::debug!(target:"GossipNode", "Removed peer {} from shared peer list", peer_id);
+
+                        // Update peer count metric
+                        metrics::CONNECTED_PEERS.set(count as f64);
                     },
                     // TODO: implement events handling
                     _ => tracing::debug!(target:"GossipNode","Got new event from network"),

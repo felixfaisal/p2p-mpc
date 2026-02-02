@@ -160,10 +160,12 @@ impl AuxParty {
             match Self::load_primes_from_disk(self.id) {
                 Some(primes) => {
                     tracing::info!("✓ Party {} loaded cached Paillier primes", self.id);
+                    metrics::PAILLIER_PRIMES_CACHE_HITS.inc();
                     primes
                 }
                 None => {
                     tracing::info!("⏳ Party {} generating new Paillier primes...", self.id);
+                    metrics::PAILLIER_PRIMES_CACHE_MISSES.inc();
                     let primes = PregeneratedPrimes::generate(&mut rng);
                     Self::save_primes_to_disk(self.id, &primes);
                     tracing::info!("✓ Party {} finished generating and cached primes", self.id);
