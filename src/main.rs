@@ -6,6 +6,9 @@ mod network;
 mod rpc;
 mod tracing_config;
 
+#[cfg(test)]
+mod test;
+
 use cli::Cli;
 use libp2p::{PeerId, identity};
 use network::Network;
