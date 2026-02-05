@@ -146,6 +146,7 @@ pub struct InitiateSigningResponse {
     pub message: String,
     pub execution_id: Option<String>,
     pub signers: Option<Vec<u16>>,
+    pub signature: Option<String>,
 }
 
 /// RPC API definition
@@ -752,6 +753,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
                         .to_string(),
                     execution_id: None,
                     signers: None,
+                    signature: None,
                 });
             }
         };
@@ -763,6 +765,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
                 message: "Signers list cannot be empty".to_string(),
                 execution_id: None,
                 signers: Some(signers),
+                signature: None,
             });
         }
 
@@ -779,6 +782,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
                     ),
                     execution_id: None,
                     signers: Some(signers),
+                    signature: None,
                 });
             }
         }
@@ -800,6 +804,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
                     ),
                     execution_id: None,
                     signers: Some(signers),
+                    signature: None,
                 });
             }
         }
@@ -846,25 +851,58 @@ impl NetworkRpcServer for NetworkRpcImpl {
                                 message: format!("Failed to process locally: {}", e),
                                 execution_id: Some(execution_id_hex),
                                 signers: Some(signers),
+                                signature: None,
                             });
                         }
 
-                        Ok(InitiateSigningResponse {
-                            success: true,
-                            message: format!(
-                                "Signing initiated with {} signers for message: {}",
-                                signers.len(),
-                                message
-                            ),
-                            execution_id: Some(execution_id_hex),
-                            signers: Some(signers),
-                        })
+                        // Wait for the signature to be generated (with timeout)
+                        drop(orchestrator_lock); // Release the write lock
+
+                        tracing::info!("⏳ Waiting for signature generation to complete...");
+                        let timeout = std::time::Duration::from_secs(60); // 60 second timeout
+
+                        let orch_read = self.info.mpc_orchestrator.read().await;
+                        let signature = if let Some(orch) = orch_read.as_ref() {
+                            orch.wait_for_signature(timeout).await
+                        } else {
+                            None
+                        };
+
+                        match signature {
+                            Some(sig) => {
+                                tracing::info!("✅ Signature generated successfully");
+                                Ok(InitiateSigningResponse {
+                                    success: true,
+                                    message: format!(
+                                        "Signing completed with {} signers for message: {}",
+                                        signers.len(),
+                                        message
+                                    ),
+                                    execution_id: Some(execution_id_hex),
+                                    signers: Some(signers),
+                                    signature: Some(sig),
+                                })
+                            }
+                            None => {
+                                tracing::error!(
+                                    "❌ Failed to generate signature (timeout or failure)"
+                                );
+                                Ok(InitiateSigningResponse {
+                                    success: false,
+                                    message: "Signing initiated but failed to complete (timeout or error)".to_string(),
+                                    execution_id: Some(execution_id_hex),
+                                    signers: Some(signers),
+                                    signature: None,
+                                })
+                            }
+                        }
                     }
                     Err(e) => Ok(InitiateSigningResponse {
                         success: false,
                         message: format!("Failed to broadcast message: {}", e),
                         execution_id: Some(execution_id_hex),
                         signers: Some(signers),
+                        signature: None,
                     }),
                 }
             }
@@ -873,6 +911,7 @@ impl NetworkRpcServer for NetworkRpcImpl {
                 message: format!("Failed to serialize coordination message: {}", e),
                 execution_id: None,
                 signers: Some(signers),
+                signature: None,
             }),
         }
     }

@@ -257,6 +257,37 @@ impl MPCOrchestrator {
         self.state.read().await.clone()
     }
 
+    /// Wait for signing to complete and return the signature
+    /// Returns None if timeout occurs or protocol fails
+    pub async fn wait_for_signature(&self, timeout_duration: Duration) -> Option<String> {
+        let start = Instant::now();
+
+        loop {
+            // Check if we've exceeded timeout
+            if start.elapsed() > timeout_duration {
+                tracing::warn!("Timeout waiting for signature");
+                return None;
+            }
+
+            // Check current state
+            let state = self.state.read().await;
+            match &*state {
+                ProtocolState::SigningCompleted { signature, .. } => {
+                    return Some(signature.clone());
+                }
+                ProtocolState::Failed { .. } => {
+                    tracing::error!("Protocol failed while waiting for signature");
+                    return None;
+                }
+                _ => {
+                    // Still in progress, continue waiting
+                    drop(state);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     /// Update protocol state metrics
     fn update_state_metrics(state: &ProtocolState) {
         // Reset all state gauges
